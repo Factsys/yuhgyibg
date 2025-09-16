@@ -97,7 +97,8 @@ KNOWLEDGE_BASE = {
     },
     "ai_triggers": {
         "ahk_version": {
-            "keywords": ["ahk problem", "autohotkey problem", "ahk not working", "autohotkey not working", "ahk error", "autohotkey error", "macro won't run", "can't run macro"]
+            "keywords": ["ahk problem", "autohotkey problem", "ahk not working", "autohotkey not working", "ahk error", "autohotkey error", "macro won't run", "can't run macro"],
+            "context": "User is having issues with AHK/autohotkey. Explain they need v1.1 not v2 because the macro isn't built for latest AHK"
         }
     }
 }
@@ -125,11 +126,23 @@ class LearningData:
 
 learning_data = LearningData()
 
-def find_best_answer_qa_only(message_content):
-    """Find the best answer from Q&A knowledge base only (excludes triggers)"""
+def find_best_answer(message_content):
+    """Find the best answer from knowledge base"""
     message_lower = message_content.lower()
     
-    # Only check Q&A pairs - triggers are handled separately for exact responses
+    # Check exact triggers first (these return exact responses)
+    for trigger_name, trigger_data in KNOWLEDGE_BASE["triggers"].items():
+        for keyword in trigger_data["keywords"]:
+            if keyword in message_lower:
+                return trigger_data["response"], "exact"
+    
+    # Check AI triggers (these need AI generation)
+    for trigger_name, trigger_data in KNOWLEDGE_BASE["ai_triggers"].items():
+        for keyword in trigger_data["keywords"]:
+            if keyword in message_lower:
+                return trigger_data["context"], "ai"
+    
+    # Check Q&A pairs
     best_match = None
     highest_score = 0
     
@@ -143,13 +156,15 @@ def find_best_answer_qa_only(message_content):
             highest_score = score
             best_match = qa["answer"]
     
-    return best_match
+    if best_match:
+        return best_match, "exact"
+    
+    return None, None
 
 async def generate_ai_response(question, context=""):
     """Generate AI response using Gemini API"""
-    # Check if Gemini client is available
     if not client:
-        return "AI features are currently unavailable. Please check your Gemini API key configuration."
+        return "I'm currently unable to process AI responses. Please try again later."
     
     try:
         # Create a prompt that includes the knowledge base context
@@ -168,7 +183,7 @@ Additional context: {context}
 Respond naturally and helpfully. If the question relates to something in your knowledge base, provide that information but rephrase it in your own words to sound natural. If you don't know something specific, be honest about it but try to be helpful anyway."""
 
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.0-flash",
             contents=prompt
         )
         
@@ -194,9 +209,7 @@ async def on_ready():
 async def on_member_join(member):
     """Auto-kick users with accounts less than 7 days old"""
     try:
-        # Use discord.utils.utcnow() for proper timezone-aware comparison
-        current_time = discord.utils.utcnow()
-        account_age = current_time - member.created_at
+        account_age = discord.utils.utcnow() - member.created_at
         
         if account_age < timedelta(days=7):
             try:
@@ -215,42 +228,20 @@ async def on_message(message):
     if message.author == bot.user:
         return
     
-    message_lower = message.content.lower()
-    
-    # Check for exact trigger matches first - return EXACT text without AI
-    for trigger_name, trigger_data in KNOWLEDGE_BASE["triggers"].items():
-        for keyword in trigger_data["keywords"]:
-            if keyword in message_lower:
-                # Return exact trigger response without AI modification
-                await message.reply(trigger_data["response"])
-                learning_data.add_conversation(message.author.id, message.content, trigger_data["response"])
-                await bot.process_commands(message)
-                return
-    
-    # Check for AI triggers that need generated responses
-    for trigger_name, trigger_data in KNOWLEDGE_BASE.get("ai_triggers", {}).items():
-        for keyword in trigger_data["keywords"]:
-            if keyword in message_lower:
-                if trigger_name == "ahk_version":
-                    # Generate AI response about AHK version issue
-                    ai_response = await generate_ai_response(message.content, 
-                        "The user is having problems with AutoHotkey or running the macro. They likely need to use AHK v1.1 instead of v2 because the macro isn't built for the latest AHK version. Explain this naturally.")
-                    learning_data.add_conversation(message.author.id, message.content, ai_response)
-                    await message.reply(ai_response)
-                    await bot.process_commands(message)
-                    return
-    
-    # Check if message matches knowledge base Q&A (use AI for these)
-    best_answer = find_best_answer_qa_only(message.content)
+    # Check if message matches any knowledge base triggers or questions
+    best_answer, response_type = find_best_answer(message.content)
     
     if best_answer:
-        # Generate AI response based on the knowledge
-        ai_response = await generate_ai_response(message.content, best_answer)
+        if response_type == "exact":
+            # Return exact response for triggers and Q&A
+            await message.reply(best_answer)
+        elif response_type == "ai":
+            # Generate AI response for AI triggers
+            ai_response = await generate_ai_response(message.content, best_answer)
+            await message.reply(ai_response)
         
         # Add learning data
-        learning_data.add_conversation(message.author.id, message.content, ai_response)
-        
-        await message.reply(ai_response)
+        learning_data.add_conversation(message.author.id, message.content, best_answer)
     
     # Process other commands
     await bot.process_commands(message)
@@ -286,10 +277,13 @@ async def askbloom_command(interaction: discord.Interaction, context: str):
     
     try:
         # Check if question matches knowledge base
-        best_answer = find_best_answer_qa_only(context)
+        best_answer, response_type = find_best_answer(context)
         
-        if best_answer:
-            # Generate AI response with knowledge base context
+        if best_answer and response_type == "exact":
+            # Use exact answer as context for AI enhancement
+            ai_response = await generate_ai_response(context, best_answer)
+        elif best_answer and response_type == "ai":
+            # Generate AI response with AI trigger context
             ai_response = await generate_ai_response(context, best_answer)
         else:
             # Generate general AI response
@@ -339,222 +333,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f"Bot error: {e}")bot = commands.Bot(command_prefix='!', intents=intents)
-
-class LearningData:
-    def __init__(self):
-        self.conversations = []
-        self.user_questions = {}
-    
-    def add_conversation(self, user_id, question, answer):
-        self.conversations.append({
-            "user_id": user_id,
-            "question": question,
-            "answer": answer,
-            "timestamp": datetime.now().isoformat()
-        })
-        
-        if user_id not in self.user_questions:
-            self.user_questions[user_id] = []
-        self.user_questions[user_id].append(question)
-
-learning_data = LearningData()
-
-def find_best_answer_qa_only(message_content):
-    """Find the best answer from Q&A knowledge base only (excludes triggers)"""
-    message_lower = message_content.lower()
-    
-    # Only check Q&A pairs - triggers are handled separately for exact responses
-    best_match = None
-    highest_score = 0
-    
-    for qa in KNOWLEDGE_BASE["questions"]:
-        score = 0
-        for keyword in qa["keywords"]:
-            if keyword in message_lower:
-                score += len(keyword.split())
-        
-        if score > highest_score:
-            highest_score = score
-            best_match = qa["answer"]
-    
-    return best_match
-
-async def generate_ai_response(question, context=""):
-    """Generate AI response using Gemini API"""
-    # Check if Gemini client is available
-    if not client:
-        return "AI features are currently unavailable. Please check your Gemini API key configuration."
-    
-    try:
-        # Create a prompt that includes the knowledge base context
-        knowledge_context = ""
-        for qa in KNOWLEDGE_BASE["questions"]:
-            knowledge_context += f"Q: {', '.join(qa['keywords'])}\nA: {qa['answer']}\n\n"
-        
-        prompt = f"""You are Bloom, a helpful Discord bot assistant for a gaming community focused on macros and automation tools. 
-
-Here's what you know:
-{knowledge_context}
-
-User question: {question}
-Additional context: {context}
-
-Respond naturally and helpfully. If the question relates to something in your knowledge base, provide that information but rephrase it in your own words to sound natural. If you don't know something specific, be honest about it but try to be helpful anyway."""
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
-        
-        return response.text if response.text else "I'm having trouble processing that right now. Can you try asking again?"
-    
-    except Exception as e:
-        logger.error(f"Error generating AI response: {e}")
-        return "I'm experiencing some technical difficulties. Please try again later."
-
-@bot.event
-async def on_ready():
-    if bot.user:
-        logger.info(f'✅ {bot.user.name} has connected to Discord!')
-    logger.info(f'Bot is in {len(bot.guilds)} guild(s)')
-    
-    try:
-        synced = await bot.tree.sync()
-        logger.info(f"✅ Synced {len(synced)} slash command(s)")
-    except Exception as e:
-        logger.error(f"❌ Failed to sync commands: {e}")
-
-@bot.event
-async def on_member_join(member):
-    """Auto-kick users with accounts less than 7 days old"""
-    try:
-        # Use discord.utils.utcnow() for proper timezone-aware comparison
-        current_time = discord.utils.utcnow()
-        account_age = current_time - member.created_at
-        
-        if account_age < timedelta(days=7):
-            try:
-                await member.send("You cannot join this server as your account is less than 7 days old")
-            except:
-                pass  # User might have DMs disabled
-            
-            await member.kick(reason="Account less than 7 days old")
-            logger.info(f"Kicked {member.name} - account age: {account_age.days} days")
-    
-    except Exception as e:
-        logger.error(f"Error in on_member_join: {e}")
-
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
-    
-    message_lower = message.content.lower()
-    
-    # Check for exact trigger matches first - return EXACT text without AI
-    for trigger_name, trigger_data in KNOWLEDGE_BASE["triggers"].items():
-        for keyword in trigger_data["keywords"]:
-            if keyword in message_lower:
-                # Return exact trigger response without AI modification
-                await message.reply(trigger_data["response"])
-                learning_data.add_conversation(message.author.id, message.content, trigger_data["response"])
-                await bot.process_commands(message)
-                return
-    
-    # Check for AI triggers that need generated responses
-    for trigger_name, trigger_data in KNOWLEDGE_BASE.get("ai_triggers", {}).items():
-        for keyword in trigger_data["keywords"]:
-            if keyword in message_lower:
-                if trigger_name == "ahk_version":
-                    # Generate AI response about AHK version issue
-                    ai_response = await generate_ai_response(message.content, 
-                        "The user is having problems with AutoHotkey or running the macro. They likely need to use AHK v1.1 instead of v2 because the macro isn't built for the latest AHK version. Explain this naturally.")
-                    learning_data.add_conversation(message.author.id, message.content, ai_response)
-                    await message.reply(ai_response)
-                    await bot.process_commands(message)
-                    return
-    
-    # Check if message matches knowledge base Q&A (use AI for these)
-    best_answer = find_best_answer_qa_only(message.content)
-    
-    if best_answer:
-        # Generate AI response based on the knowledge
-        ai_response = await generate_ai_response(message.content, best_answer)
-        
-        # Add learning data
-        learning_data.add_conversation(message.author.id, message.content, ai_response)
-        
-        await message.reply(ai_response)
-    
-    # Process other commands
-    await bot.process_commands(message)
-
-# Slash Commands
-@bot.tree.command(name="say", description="Make the bot say something")
-@app_commands.describe(words="The words you want the bot to say")
-async def say_command(interaction: discord.Interaction, words: str):
-    await interaction.response.send_message(words)
-
-@bot.tree.command(name="saywb", description="Send an embedded message")
-@app_commands.describe(
-    words="The main message content",
-    title="Optional title for the embed",
-    description="Optional description for the embed"
-)
-async def saywb_command(interaction: discord.Interaction, words: str, title: str = "", description: str = ""):
-    embed = discord.Embed(
-        title=title if title else "Message",
-        description=description if description else words,
-        color=discord.Color.blue()
-    )
-    
-    if title and description:
-        embed.add_field(name="Content", value=words, inline=False)
-    
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="askbloom", description="Ask Bloom AI a question with context")
-@app_commands.describe(context="Your question or context for Bloom to respond to")
-async def askbloom_command(interaction: discord.Interaction, context: str):
-    await interaction.response.defer()
-    
-    try:
-        # Check if question matches knowledge base
-        best_answer = find_best_answer_qa_only(context)
-        
-        if best_answer:
-            # Generate AI response with knowledge base context
-            ai_response = await generate_ai_response(context, best_answer)
-        else:
-            # Generate general AI response
-            ai_response = await generate_ai_response(context)
-        
-        # Add to learning data
-        learning_data.add_conversation(interaction.user.id, context, ai_response)
-        
-        # Create embed for response
-        embed = discord.Embed(
-            title="🤖 Bloom AI Response",
-            description=ai_response,
-            color=discord.Color.green()
-        )
-        embed.set_footer(text=f"Asked by {interaction.user.display_name}")
-        
-        await interaction.followup.send(embed=embed)
-    
-    except Exception as e:
-        logger.error(f"Error in askbloom command: {e}")
-        await interaction.followup.send("I'm having trouble processing your request. Please try again later.")
-
-# Error handling
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
-        return
-    
-    logger.error(f"Command error: {error}")
-    await ctx.send("An error occurred while processing your command.")
-
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+        logger.error(f"Bot error: {e}")
