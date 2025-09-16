@@ -1,4 +1,11 @@
 import os
+import sys
+from unittest.mock import MagicMock
+
+# Mock audioop module before importing discord to prevent ModuleNotFoundError
+# This allows discord.py to import without the audioop dependency on Python 3.13+
+sys.modules['audioop'] = MagicMock()
+
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -103,8 +110,13 @@ KNOWLEDGE_BASE = {
     }
 }
 
-# Bot setup
-intents = discord.Intents.all()
+# Bot setup - optimized intents without voice functionality
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True  # For member join events
+intents.guilds = True
+# Explicitly disable voice-related intents to avoid audioop dependency
+intents.voice_states = False
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 class LearningData:
