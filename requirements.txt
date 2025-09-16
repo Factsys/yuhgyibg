@@ -1,5 +1,5 @@
-"discord-py>=2.5.2",
-    "flask>=3.1.1",
-    "google-genai>=1.37.0",
-    "sift-stack-py>=0.9.0",
-    "trafilatura>=2.0.0",
+discord.py
+google-genai
+requests
+beautifulsoup4
+trafilatura
