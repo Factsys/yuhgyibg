@@ -16,6 +16,9 @@ from datetime import datetime, timedelta
 import re
 from google import genai
 from google.genai import types
+import requests
+from bs4 import BeautifulSoup
+import trafilatura
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -110,19 +113,21 @@ KNOWLEDGE_BASE = {
     }
 }
 
-# Bot setup - optimized intents without voice functionality
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True  # For member join events
-intents.guilds = True
-# Explicitly disable voice-related intents to avoid audioop dependency
-intents.voice_states = False
+# Bot setup - absolutely minimal intents (no privileged intents)
+intents = discord.Intents.none()  # Start with NO intents
+intents.guilds = True  # Basic guild access
+intents.guild_messages = True  # Receive messages
+# Note: message_content intent disabled until enabled in Discord Developer Portal
+# To enable smart responses, you need to enable 'Message Content Intent' at:
+# https://discord.com/developers/applications/ -> Your Bot -> Bot Section -> Privileged Gateway Intents
+# intents.message_content = True  # Uncomment after enabling in portal
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 class LearningData:
     def __init__(self):
         self.conversations = []
         self.user_questions = {}
+        self.learned_content = []  # Store learned documents
     
     def add_conversation(self, user_id, question, answer):
         self.conversations.append({
@@ -135,64 +140,146 @@ class LearningData:
         if user_id not in self.user_questions:
             self.user_questions[user_id] = []
         self.user_questions[user_id].append(question)
+    
+    def add_learned_content(self, url, title, content, user_id):
+        self.learned_content.append({
+            "url": url,
+            "title": title,
+            "content": content,
+            "learned_by": user_id,
+            "timestamp": datetime.now().isoformat()
+        })
+    
+    def get_learned_content_summary(self):
+        """Get a summary of all learned content for AI context"""
+        if not self.learned_content:
+            return ""
+        
+        summary = "LEARNED DOCUMENTS:\n\n"
+        for doc in self.learned_content[-10:]:  # Last 10 documents
+            summary += f"Title: {doc['title']}\n"
+            summary += f"Content Summary: {doc['content'][:500]}...\n"
+            summary += f"Source: {doc['url']}\n\n"
+        return summary
 
 learning_data = LearningData()
 
-def find_best_answer(message_content):
-    """Find the best answer from knowledge base"""
-    message_lower = message_content.lower()
+async def analyze_user_intent(message_content):
+    """Use AI to analyze user intent and find relevant knowledge"""
+    if not client:
+        return None, None
     
-    # Check exact triggers first (these return exact responses)
-    for trigger_name, trigger_data in KNOWLEDGE_BASE["triggers"].items():
-        for keyword in trigger_data["keywords"]:
-            if keyword in message_lower:
-                return trigger_data["response"], "exact"
-    
-    # Check AI triggers (these need AI generation)
-    for trigger_name, trigger_data in KNOWLEDGE_BASE["ai_triggers"].items():
-        for keyword in trigger_data["keywords"]:
-            if keyword in message_lower:
-                return trigger_data["context"], "ai"
-    
-    # Check Q&A pairs
-    best_match = None
-    highest_score = 0
-    
-    for qa in KNOWLEDGE_BASE["questions"]:
-        score = 0
-        for keyword in qa["keywords"]:
-            if keyword in message_lower:
-                score += len(keyword.split())
+    try:
+        # Create knowledge context for AI
+        knowledge_context = "Here's what I know about:\n\n"
         
-        if score > highest_score:
-            highest_score = score
-            best_match = qa["answer"]
-    
-    if best_match:
-        return best_match, "exact"
-    
-    return None, None
+        # Add all Q&A knowledge
+        for qa in KNOWLEDGE_BASE["questions"]:
+            topics = ", ".join(qa["keywords"])
+            knowledge_context += f"• {topics}: {qa['answer']}\n"
+        
+        # Add trigger information
+        for trigger_name, trigger_data in KNOWLEDGE_BASE["triggers"].items():
+            topics = ", ".join(trigger_data["keywords"])
+            knowledge_context += f"• {topics}: {trigger_data['response']}\n"
+        
+        # Add AI trigger contexts
+        for trigger_name, trigger_data in KNOWLEDGE_BASE["ai_triggers"].items():
+            topics = ", ".join(trigger_data["keywords"])
+            knowledge_context += f"• {topics}: {trigger_data['context']}\n"
+        
+        # Add learned content
+        learned_summary = learning_data.get_learned_content_summary()
+        if learned_summary:
+            knowledge_context += f"\n{learned_summary}"
+        
+        # AI prompt for understanding intent
+        intent_prompt = f"""You are an intelligent assistant analyzing user messages for a gaming/macro community.
 
-async def generate_ai_response(question, context=""):
-    """Generate AI response using Gemini API"""
+Knowledge Base:
+{knowledge_context}
+
+User Message: "{message_content}"
+
+Analyze this message and respond with ONLY ONE of these formats:
+1. If the message relates to something in the knowledge base: "RELEVANT: [brief description of what they're asking about]"
+2. If the message is unrelated to the knowledge base: "UNRELATED"
+3. If it's a greeting/casual chat: "CASUAL"
+
+Be smart about understanding context - if someone says "where do I get the thing for fishing" they probably mean the macro, even if they don't say "macro" exactly."""
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=intent_prompt
+        )
+        
+        if response.text:
+            result = response.text.strip()
+            if result.startswith("RELEVANT:"):
+                context = result.replace("RELEVANT:", "").strip()
+                return context, "ai_contextual"
+            elif result.startswith("CASUAL"):
+                return "casual_chat", "casual"
+            else:
+                return None, None
+        
+        return None, None
+        
+    except Exception as e:
+        logger.error(f"Error analyzing user intent: {e}")
+        return None, None
+
+async def generate_smart_response(question, intent_context=None, response_type="ai_contextual"):
+    """Generate intelligent AI response based on user intent and context"""
     if not client:
         return "I'm currently unable to process AI responses. Please try again later."
     
     try:
-        # Create a prompt that includes the knowledge base context
-        knowledge_context = ""
-        for qa in KNOWLEDGE_BASE["questions"]:
-            knowledge_context += f"Q: {', '.join(qa['keywords'])}\nA: {qa['answer']}\n\n"
+        # Create comprehensive knowledge base for AI
+        full_knowledge = "COMMUNITY KNOWLEDGE:\n\n"
         
-        prompt = f"""You are Bloom, a helpful Discord bot assistant for a gaming community focused on macros and automation tools. 
+        # Add all knowledge with better formatting
+        for qa in KNOWLEDGE_BASE["questions"]:
+            topics = ", ".join(qa["keywords"])
+            full_knowledge += f"Topic: {topics}\nInfo: {qa['answer']}\n\n"
+        
+        for trigger_name, trigger_data in KNOWLEDGE_BASE["triggers"].items():
+            topics = ", ".join(trigger_data["keywords"])
+            full_knowledge += f"Topic: {topics}\nInfo: {trigger_data['response']}\n\n"
+        
+        for trigger_name, trigger_data in KNOWLEDGE_BASE["ai_triggers"].items():
+            topics = ", ".join(trigger_data["keywords"])
+            full_knowledge += f"Topic: {topics}\nContext: {trigger_data['context']}\n\n"
+        
+        # Add learned content to knowledge base
+        learned_summary = learning_data.get_learned_content_summary()
+        if learned_summary:
+            full_knowledge += f"\n{learned_summary}"
+        
+        if response_type == "casual":
+            prompt = f"""You are Bloom, a friendly Discord bot for a gaming/macro community. The user sent a casual message: "{question}"
 
-Here's what you know:
-{knowledge_context}
+Respond in a friendly, natural way. Keep it conversational and welcoming. You can mention that you're here to help with macros, configs, or any questions they might have."""
+        
+        else:
+            prompt = f"""You are Bloom, an intelligent Discord bot assistant that can help with anything!
 
-User question: {question}
-Additional context: {context}
+{full_knowledge}
 
-Respond naturally and helpfully. If the question relates to something in your knowledge base, provide that information but rephrase it in your own words to sound natural. If you don't know something specific, be honest about it but try to be helpful anyway."""
+User asked: "{question}"
+Intent analysis suggests they're asking about: {intent_context or 'general topic'}
+
+Instructions:
+- You can help with ANY topic, not just gaming/macros - be a general assistant!
+- Use your knowledge base when relevant, but also use your general AI knowledge
+- Understand what they REALLY mean, not just literal words
+- Explain things clearly and naturally - don't just copy/paste answers
+- If their question relates to multiple topics, address them all
+- If you're not sure exactly what they need, ask clarifying questions
+- Be helpful and friendly
+- Draw from both your learned content AND general knowledge to give comprehensive answers
+
+Generate a smart, helpful response:"""
 
         response = client.models.generate_content(
             model="gemini-2.0-flash",
@@ -202,7 +289,7 @@ Respond naturally and helpfully. If the question relates to something in your kn
         return response.text if response.text else "I'm having trouble processing that right now. Can you try asking again?"
     
     except Exception as e:
-        logger.error(f"Error generating AI response: {e}")
+        logger.error(f"Error generating smart response: {e}")
         return "I'm experiencing some technical difficulties. Please try again later."
 
 @bot.event
@@ -217,43 +304,43 @@ async def on_ready():
     except Exception as e:
         logger.error(f"❌ Failed to sync commands: {e}")
 
-@bot.event
-async def on_member_join(member):
-    """Auto-kick users with accounts less than 7 days old"""
-    try:
-        account_age = discord.utils.utcnow() - member.created_at
-        
-        if account_age < timedelta(days=7):
-            try:
-                await member.send("You cannot join this server as your account is less than 7 days old")
-            except:
-                pass  # User might have DMs disabled
-            
-            await member.kick(reason="Account less than 7 days old")
-            logger.info(f"Kicked {member.name} - account age: {account_age.days} days")
-    
-    except Exception as e:
-        logger.error(f"Error in on_member_join: {e}")
+# Note: on_member_join disabled due to privileged intents requirement
+# To enable this feature, you need to enable 'Server Members Intent' 
+# in Discord Developer Portal under your bot's application settings
+
+# @bot.event
+# async def on_member_join(member):
+#     """Auto-kick users with accounts less than 7 days old"""
+#     try:
+#         account_age = discord.utils.utcnow() - member.created_at
+#         
+#         if account_age < timedelta(days=7):
+#             try:
+#                 await member.send("You cannot join this server as your account is less than 7 days old")
+#             except:
+#                 pass  # User might have DMs disabled
+#             
+#             await member.kick(reason="Account less than 7 days old")
+#             logger.info(f"Kicked {member.name} - account age: {account_age.days} days")
+#     
+#     except Exception as e:
+#         logger.error(f"Error in on_member_join: {e}")
 
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
     
-    # Check if message matches any knowledge base triggers or questions
-    best_answer, response_type = find_best_answer(message.content)
+    # Use AI to understand what the user is really asking about
+    intent_context, response_type = await analyze_user_intent(message.content)
     
-    if best_answer:
-        if response_type == "exact":
-            # Return exact response for triggers and Q&A
-            await message.reply(best_answer)
-        elif response_type == "ai":
-            # Generate AI response for AI triggers
-            ai_response = await generate_ai_response(message.content, best_answer)
-            await message.reply(ai_response)
+    if intent_context and response_type:
+        # Generate intelligent response based on understanding
+        smart_response = await generate_smart_response(message.content, intent_context, response_type)
+        await message.reply(smart_response)
         
         # Add learning data
-        learning_data.add_conversation(message.author.id, message.content, best_answer)
+        learning_data.add_conversation(message.author.id, message.content, smart_response)
     
     # Process other commands
     await bot.process_commands(message)
@@ -282,40 +369,42 @@ async def saywb_command(interaction: discord.Interaction, words: str, title: str
     
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="askbloom", description="Ask Bloom AI a question with context")
-@app_commands.describe(context="Your question or context for Bloom to respond to")
+@bot.tree.command(name="askbloom", description="Ask Bloom AI a question - I'll understand what you mean!")
+@app_commands.describe(context="Your question - I'll figure out what you're asking about!")
 async def askbloom_command(interaction: discord.Interaction, context: str):
     await interaction.response.defer()
     
     try:
-        # Check if question matches knowledge base
-        best_answer, response_type = find_best_answer(context)
+        # Use AI to understand the question deeply
+        intent_context, response_type = await analyze_user_intent(context)
         
-        if best_answer and response_type == "exact":
-            # Use exact answer as context for AI enhancement
-            ai_response = await generate_ai_response(context, best_answer)
-        elif best_answer and response_type == "ai":
-            # Generate AI response with AI trigger context
-            ai_response = await generate_ai_response(context, best_answer)
-        else:
-            # Generate general AI response
-            ai_response = await generate_ai_response(context)
+        # Generate intelligent response
+        if not intent_context:
+            intent_context = "general question"
+            response_type = "ai_contextual"
+        
+        ai_response = await generate_smart_response(context, intent_context, response_type)
         
         # Add to learning data
         learning_data.add_conversation(interaction.user.id, context, ai_response)
         
-        # Create embed for response
+        # Create enhanced embed for response
         embed = discord.Embed(
-            title="🤖 Bloom AI Response",
+            title="🧠 Bloom Smart Response",
             description=ai_response,
-            color=discord.Color.green()
+            color=discord.Color.purple()
+        )
+        embed.add_field(
+            name="💭 Understanding", 
+            value=f"I interpreted this as: {intent_context}", 
+            inline=False
         )
         embed.set_footer(text=f"Asked by {interaction.user.display_name}")
         
         await interaction.followup.send(embed=embed)
     
     except Exception as e:
-        logger.error(f"Error in askbloom command: {e}")
+        logger.error(f"Error in smart askbloom command: {e}")
         await interaction.followup.send("I'm having trouble processing your request. Please try again later.")
 
 # Error handling
