@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 from unittest.mock import MagicMock
 
 # Mock audioop module before importing discord to prevent ModuleNotFoundError
@@ -25,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 discord_token = os.environ.get("TOKEN")
-gemini_key = os.environ.get("AIzaSyAO4jV2tNyVJ1-Hagvuqg9lpUd6kF5KkRs") or "YOUR_GEMINI_KEY_HERE"
+gemini_key = os.environ.get("GEMINI_API_KEY")
 
 if not discord_token:
     logger.warning("⚠️ TOKEN not set!")
@@ -41,35 +42,6 @@ if gemini_key:
     except Exception as e:
         logger.error(f"❌ Gemini init failed: {e}")
 
-# -----------------------------
-# Knowledge Base
-# -----------------------------
-KNOWLEDGE_BASE = {
-    "questions": [
-        {
-            "keywords": ["where is the macro", "macro location", "find macro"],
-            "answer": "macros from us will be in https://discord.com/channels/1341949236471926804/1413837110770925578 (click it)"
-        },
-        {
-            "keywords": ["how do i verify", "verification", "verify account"],
-            "answer": "go to <#1411335498945003654> and use /verify"
-        },
-        {
-            "keywords": ["macro malware", "macro virus", "is macro safe", "malware", "virus"],
-            "answer": "no the macro is open source and is not malware"
-        }
-    ],
-    "triggers": {
-        "ahk": {
-            "keywords": ["ahk", "autohotkey", "how to open macro"],
-            "response": "You need this to open the macro: https://autohotkey.com (download v.1.1)"
-        },
-        "macro": {
-            "keywords": ["where is fish", "fisch macro", "just macro", "fish macro"],
-            "response": "if you want the fisch macro go to <#1413837110770925578>"
-        }
-    }
-}
 
 # -----------------------------
 # Bot setup
@@ -77,6 +49,7 @@ KNOWLEDGE_BASE = {
 intents = discord.Intents.none()
 intents.guilds = True
 intents.guild_messages = True
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # -----------------------------
@@ -117,12 +90,21 @@ class LearningData:
 learning_data = LearningData()
 
 # -----------------------------
+# Load FAQ Documents
+# -----------------------------
+faq_docs = {}
+try:
+    with open('learned_docs.json', 'r', encoding='utf-8') as f:
+        faq_docs = json.load(f)
+    logger.info(f"✅ Loaded {len(faq_docs)} FAQ documents")
+except FileNotFoundError:
+    logger.warning("⚠️ FAQ documents not found")
+except Exception as e:
+    logger.error(f"❌ Failed to load FAQ documents: {e}")
+
+# -----------------------------
 # Hehe feature
 # -----------------------------
-hehe_config = {
-    "chance": 0.5,   # default percent
-    "context": "hi"  # default context
-}
 
 # -----------------------------
 # KB fuzzy matching
@@ -134,55 +116,124 @@ def fuzzy_match(word, keywords, cutoff=0.7):
             return True
     return False
 
-def match_knowledge(message: str):
-    text = message.lower()
-    question_words = ["where", "how", "what", "why", "when", "who", "get", "find", "location", "verify", "setup", "?"]
-    is_question = any(q in text for q in question_words)
-    if not is_question:
+def search_faq_docs(query: str):
+    """Search FAQ documents for relevant content"""
+    if not faq_docs:
         return None
+    
+    query_lower = query.lower()
+    
+    # Domain-specific keywords that must be present
+    domain_keywords = [
+        'roblox', 'camera', 'zoom', 'shake', 'macro', 'bloxlink', 'helper', 
+        'deadzone', 'tolerance', 'autohotkey', 'fisch', 'graphics', 'navigation',
+        'failsafe', 'restart', 'delay', 'cast', 'rod', 'bait', 'microsoft',
+        'web', 'transparent', 'head', 'mouse', 'stationary', 'limping', 'staff',
+        'banned', 'version', 'scroll', 'sensitivity', 'tooltips'
+    ]
+    
+    # Check if query contains at least one domain keyword
+    has_domain_keyword = any(keyword in query_lower for keyword in domain_keywords)
+    if not has_domain_keyword:
+        return None
+    
+    # Stopwords to filter out
+    stopwords = {'the', 'and', 'with', 'are', 'for', 'that', 'this', 'but', 'not', 'you', 'all', 'can', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'use', 'man', 'new', 'now', 'old', 'see', 'him', 'two', 'how', 'its', 'who', 'oil', 'sit', 'set'}
+    
+    best_match = None
+    best_score = 0
+    
+    for doc_key, doc_data in faq_docs.items():
+        content = doc_data['content'].lower()
+        # Score based on meaningful words, filtering stopwords
+        words = [w for w in query_lower.split() if len(w) > 2 and w not in stopwords]
+        score = sum(1 for word in words if word in content)
+        
+        if score >= 2 and score > best_score:  # Require at least 2 meaningful matches
+            best_score = score
+            # Extract relevant section (300 chars max)
+            for word in words:
+                if word in content:
+                    pos = content.find(word)
+                    start = max(0, pos - 100)
+                    end = min(len(content), pos + 200)
+                    excerpt = doc_data['content'][start:end].strip()
+                    if len(excerpt) > 300:
+                        excerpt = excerpt[:300] + "..."
+                    best_match = {
+                        'title': doc_data['title'],
+                        'excerpt': excerpt,
+                        'score': score
+                    }
+                    break
+    
+    return best_match
 
-    for qa in KNOWLEDGE_BASE["questions"]:
-        for kw in qa["keywords"]:
-            if kw in text or fuzzy_match(text, [kw]):
-                return qa["answer"]
-
-    for trigger_name, trigger in KNOWLEDGE_BASE["triggers"].items():
-        for kw in trigger["keywords"]:
-            if kw in text or fuzzy_match(text, [kw]):
-                return trigger["response"]
-
-    return None
 
 # -----------------------------
 # AI helper
 # -----------------------------
-async def generate_smart_response(question, intent_context=None):
+async def check_doc_relevance(message):
+    """Check if message is related to documentation topics"""
     if not client:
-        return "AI is disabled."
+        return False, None
+    
     try:
-        full_knowledge = "COMMUNITY KNOWLEDGE:\n\n"
-        for qa in KNOWLEDGE_BASE["questions"]:
-            topics = ", ".join(qa["keywords"])
-            full_knowledge += f"Topic: {topics}\nInfo: {qa['answer']}\n\n"
-        for trigger_name, trigger in KNOWLEDGE_BASE["triggers"].items():
-            topics = ", ".join(trigger["keywords"])
-            full_knowledge += f"Topic: {topics}\nInfo: {trigger['response']}\n\n"
-        learned_summary = learning_data.get_learned_content_summary()
-        if learned_summary:
-            full_knowledge += f"\n{learned_summary}"
-        prompt = f"""You are Bloom, a helpful Discord bot.
+        # Build context from docs
+        docs_context = ""
+        if faq_docs:
+            for doc_key, doc_data in faq_docs.items():
+                docs_context += f"Document: {doc_data['title']}\n"
+                docs_context += f"Key topics: {doc_data['content'][:800]}...\n\n"
+        
+        prompt = f"""Analyze if this message is related to these documentation topics:
 
-{full_knowledge}
+{docs_context}
 
-User asked: "{question}"
-Interpreted as: {intent_context or 'general'}
+Message: "{message}"
 
-Give a natural and helpful response:"""
+Respond with:
+- "YES" if related to roblox, fisch, macro, autohotkey, helper guidelines, camera settings, or similar topics from the docs
+- "NO" if unrelated (greetings, random chat, off-topic)
+
+If YES, provide a helpful answer based ONLY on the documentation content.
+
+Format: YES/NO|Answer (if YES)"""
+        
         response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-        return response.text if response.text else "I'm having trouble answering right now."
+        if response.text:
+            parts = response.text.strip().split('|', 1)
+            is_relevant = parts[0].strip().upper() == 'YES'
+            answer = parts[1].strip() if len(parts) > 1 and is_relevant else None
+            return is_relevant, answer
+        return False, None
     except Exception as e:
-        logger.error(f"AI error: {e}")
-        return "I'm experiencing some technical difficulties."
+        logger.error(f"Relevance check error: {e}")
+        return False, None
+
+def get_specific_responses(message):
+    """Handle specific common questions"""
+    text = message.lower()
+    
+    # Fisch macro location
+    if any(term in text for term in ['fisch', 'fish']) and any(term in text for term in ['macro', 'where', 'location']):
+        return "https://discord.com/channels/1341949236471926804/1413837110770925578 - You can find the fisch macro in this channel."
+    
+    # AHK version question
+    if any(term in text for term in ['ahk', 'autohotkey']) and any(term in text for term in ['version', 'what']):
+        return "Use AutoHotkey v1.1 for the fisch macro."
+    
+    # Macro not working
+    if any(term in text for term in ['not working', 'broken', 'doesnt work', "doesn't work", 'help']) and 'macro' in text:
+        return """To fix macro issues:
+1. Download AutoHotkey v1.1 from https://autohotkey.com
+2. Use Web Roblox (not Microsoft Store version)
+3. Check your Navigation Key settings
+4. Ensure Auto Lower Graphics is enabled
+5. Make sure you have the correct delays configured
+6. Verify your camera zoom and shake settings are properly set up"""
+    
+    return None
 
 # -----------------------------
 # Events
@@ -202,43 +253,38 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # --- Hehe random reply ---
-    roll = random.uniform(0, 100)
-    if roll < hehe_config["chance"]:
-        reply_prompt = f"""You are Bloom, a playful Discord bot. 
-The user said: "{message.content}".
-Random reply context: "{hehe_config['context']}".
-
-Respond casually and naturally."""
-        try:
-            response = client.models.generate_content(model="gemini-2.0-flash", contents=reply_prompt)
-            if response.text:
-                await message.reply(response.text.strip())
-                return  # exclusive
-        except Exception as e:
-            logger.error(f"Hehe AI error: {e}")
-    # --------------------------
-
-    # KB detection
-    kb_answer = match_knowledge(message.content)
-    if kb_answer:
-        await message.reply(kb_answer)
-        learning_data.add_conversation(message.author.id, message.content, kb_answer)
+    # Use AI to check if message is related to docs FIRST
+    is_relevant, ai_answer = await check_doc_relevance(message.content)
+    if not is_relevant:
+        # If not doc-related, stay completely silent
+        await bot.process_commands(message)
         return
 
-    # AI fallback
-    smart_response = await generate_smart_response(message.content, "general")
-    await message.reply(smart_response)
-    learning_data.add_conversation(message.author.id, message.content, smart_response)
+    # If relevant, check specific hardcoded responses first
+    specific_response = get_specific_responses(message.content)
+    if specific_response:
+        await message.reply(specific_response)
+        learning_data.add_conversation(message.author.id, message.content, specific_response)
+        return
+
+    # Then check FAQ documents
+    faq_result = search_faq_docs(message.content)
+    if faq_result:
+        response = f"**{faq_result['title']}:**\\n{faq_result['excerpt']}"
+        await message.reply(response)
+        learning_data.add_conversation(message.author.id, message.content, response)
+        return
+
+    # Finally use AI answer if available
+    if ai_answer:
+        await message.reply(ai_answer)
+        learning_data.add_conversation(message.author.id, message.content, ai_answer)
 
     await bot.process_commands(message)
 
 # -----------------------------
 # Slash Commands
 # -----------------------------
-@bot.tree.command(name="say", description="Make the bot say something")
-async def say_command(interaction: discord.Interaction, words: str):
-    await interaction.response.send_message(words)
 
 @bot.tree.command(name="learn", description="Teach Bloom something new")
 @app_commands.describe(
@@ -252,7 +298,7 @@ async def learn_command(interaction: discord.Interaction, url: str = "", title: 
     # If URL provided, try fetching text
     if url:
         try:
-            resp = requests.get(url)
+            resp = requests.get(url, timeout=10)
             if resp.status_code == 200:
                 downloaded = trafilatura.extract(resp.text)
                 if downloaded:
@@ -271,18 +317,32 @@ async def learn_command(interaction: discord.Interaction, url: str = "", title: 
     learning_data.add_learned_content(url, title, text_content.strip(), interaction.user.id)
     await interaction.response.send_message(f"✅ Learned new content titled **{title}**", ephemeral=True)
 
-@bot.tree.command(name="hehe", description="Set a random reply chance and context")
-@app_commands.describe(
-    percent="Chance (0.1 - 100) that Bloom will reply randomly",
-    context="The playful context for random replies"
-)
-async def hehe_command(interaction: discord.Interaction, percent: float, context: str):
-    if percent < 0.1 or percent > 100:
-        await interaction.response.send_message("❌ Please provide a percentage between 0.1 and 100.", ephemeral=True)
+@bot.tree.command(name="ask", description="Ask a question about macros or helpers")
+@app_commands.describe(question="Your question about macros, settings, or helper guidelines")
+async def ask_command(interaction: discord.Interaction, question: str):
+    # Check specific responses first
+    specific_response = get_specific_responses(question)
+    if specific_response:
+        await interaction.response.send_message(specific_response)
+        learning_data.add_conversation(interaction.user.id, question, specific_response)
         return
-    hehe_config["chance"] = percent
-    hehe_config["context"] = context
-    await interaction.response.send_message(f"✅ Hehe chance set to {percent}% with context: '{context}'", ephemeral=True)
+    
+    # Check FAQ documents
+    faq_result = search_faq_docs(question)
+    if faq_result:
+        response = f"**{faq_result['title']}:**\n{faq_result['excerpt']}"
+        await interaction.response.send_message(response)
+        learning_data.add_conversation(interaction.user.id, question, response)
+        return
+    
+    # Use AI to check relevance and generate answer
+    is_relevant, ai_answer = await check_doc_relevance(question)
+    if is_relevant and ai_answer:
+        await interaction.response.send_message(ai_answer)
+        learning_data.add_conversation(interaction.user.id, question, ai_answer)
+    else:
+        await interaction.response.send_message("Question not related to available documentation.", ephemeral=True)
+
 
 # -----------------------------
 # Run bot
