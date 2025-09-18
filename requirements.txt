@@ -3,3 +3,9 @@ google-genai
 requests
 beautifulsoup4
 trafilatura
+beautifulsoup4
+discord.py
+google-genai
+requests
+sift-stack-py
+trafilatura
