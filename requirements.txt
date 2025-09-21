@@ -1,11 +1,8 @@
 discord.py
-google-genai
-requests
-beautifulsoup4
+wikipedia
+duckduckgo-search
+yfinance
+newsapi-python
+google-generativeai
 trafilatura
 beautifulsoup4
-discord.py
-google-genai
-requests
-sift-stack-py
-trafilatura
