@@ -4,6 +4,7 @@ import json
 from unittest.mock import MagicMock
 from datetime import datetime, timedelta
 import re
+import time
 
 # Mock audioop module before importing discord to prevent ModuleNotFoundError
 sys.modules['audioop'] = MagicMock()
@@ -106,6 +107,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# -----------------------------
+# Rate limiting
+# -----------------------------
+last_ai_request = {}  # user_id: timestamp
+AI_COOLDOWN = 3  # seconds between AI requests per user
 
 # -----------------------------
 # Persistent data storage
@@ -270,6 +277,15 @@ def has_tellmeajoke_permission(member):
                 return True
 
     return False
+
+def can_make_ai_request(user_id):
+    """Check if user can make an AI request (rate limiting)"""
+    current_time = time.time()
+    if user_id in last_ai_request:
+        if current_time - last_ai_request[user_id] < AI_COOLDOWN:
+            return False
+    last_ai_request[user_id] = current_time
+    return True
 
 async def discord_api_search(query: str) -> str:
     """Search Discord API for relevant information"""
@@ -473,17 +489,18 @@ def get_knowledge_response(message_content):
     if (has_macro and has_where) or any(pattern in text for pattern in macro_patterns):
         return "**Fisch Macro:** https://discord.com/channels/1341949236471926804/1413837110770925578/1417999310443905116"
 
-    # Enhanced config location detection for rod configs
-    config_keywords = ['config', 'configs', 'rod', 'rods', 'settings']
-    fisch_keywords = ['fisch', 'macro']
-
-    # Check if text contains config-related words
+    # Enhanced config location detection for rod configs - only respond to actual questions
+    config_keywords = ['config', 'configs', 'settings']
+    rod_keywords = ['rod', 'rods']
+    
+    # Only respond if it's actually a question about configs
+    # Must have question indicators AND config/rod keywords
     has_config = any(keyword in text for keyword in config_keywords)
-    has_fisch = any(keyword in text for keyword in fisch_keywords)
-    has_where_config = any(keyword in text for keyword in where_keywords)
-
-    # Also check for specific patterns
-    config_patterns = [
+    has_rod = any(keyword in text for keyword in rod_keywords)
+    has_question_word = any(keyword in text for keyword in where_keywords + ['how', 'what'])
+    
+    # Specific question patterns about rod configs
+    config_question_patterns = [
         'where can i find the config',
         'where can i find the fisch config',
         'where fisch config',
@@ -494,10 +511,15 @@ def get_knowledge_response(message_content):
         'configs for rod',
         'fisch rod config',
         'macro config',
-        'where rod settings'
+        'where rod settings',
+        'how to config',
+        'what config',
+        'need config',
+        'find config'
     ]
 
-    if ((has_config and has_fisch) or (has_config and has_where_config)) or any(pattern in text for pattern in config_patterns):
+    # Only show config link if it's clearly a question about configs
+    if (has_config and (has_question_word or text.endswith('?'))) or any(pattern in text for pattern in config_question_patterns):
         return "**Fisch Rod Configs:** https://discord.com/channels/1341949236471926804/1411335491457913014"
 
     # Mango/Fisch macro location
@@ -597,6 +619,11 @@ async def askbloom_command(interaction: discord.Interaction, question: str):
         await interaction.response.send_message("❌ AI service not available.", ephemeral=True)
         return
 
+    # Rate limiting check
+    if not can_make_ai_request(interaction.user.id):
+        await interaction.response.send_message("⏱️ Please wait a few seconds before asking another question!", ephemeral=True)
+        return
+
     # Content filter
     question_lower = question.lower()
     banned_words = ['racist', 'racism', 'nazi', 'hitler', 'slur', 'hate speech', 'nigger', 'faggot']
@@ -650,8 +677,12 @@ Provide a helpful response under 1800 characters. Be direct and informative."""
                     else:
                         await interaction.followup.send("❌ Couldn't generate response. Try again!")
                 except Exception as ai_error:
+                    error_str = str(ai_error)
                     logger.error(f"AI generation error: {ai_error}")
-                    await interaction.followup.send("❌ AI service temporarily unavailable. Try again!")
+                    if "429" in error_str or "Too Many Requests" in error_str:
+                        await interaction.followup.send("⏱️ AI service is currently rate limited. Please try again in a few minutes!")
+                    else:
+                        await interaction.followup.send("❌ AI service temporarily unavailable. Try again!")
 
             except Exception as search_error:
                 logger.error(f"Search error: {search_error}")
@@ -762,6 +793,11 @@ async def tellmeajoke_command(interaction: discord.Interaction, context: str):
         await interaction.response.send_message("❌ AI service not available.", ephemeral=True)
         return
 
+    # Rate limiting check
+    if not can_make_ai_request(interaction.user.id):
+        await interaction.response.send_message("⏱️ Please wait a few seconds before requesting another joke!", ephemeral=True)
+        return
+
     # Content filter
     context_lower = context.lower()
     banned_words = ['racist', 'racism', 'nazi', 'hitler', 'slur', 'hate speech', 'nigger', 'faggot']
@@ -785,8 +821,12 @@ Make it witty and humorous but not offensive or mean-spirited. Keep it under 500
             await interaction.response.send_message("❌ Couldn't generate a joke. Try again!", ephemeral=True)
 
     except Exception as e:
+        error_str = str(e)
         logger.error(f"Tellmeajoke error: {e}")
-        await interaction.response.send_message("❌ Something went wrong. Try again!", ephemeral=True)
+        if "429" in error_str or "Too Many Requests" in error_str:
+            await interaction.response.send_message("⏱️ AI service is currently rate limited. Please try again in a few minutes!", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Something went wrong. Try again!", ephemeral=True)
 
 @bot.tree.command(name="whatisthisserverabout", description="Learn about this Discord server")
 async def whatisthisserverabout_command(interaction: discord.Interaction):
