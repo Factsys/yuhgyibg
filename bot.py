@@ -4,7 +4,6 @@ import json
 from unittest.mock import MagicMock
 from datetime import datetime, timedelta
 import re
-import time
 
 # Mock audioop module before importing discord to prevent ModuleNotFoundError
 sys.modules['audioop'] = MagicMock()
@@ -50,11 +49,6 @@ try:
     import google.generativeai as genai
 except ImportError:
     genai = None
-
-try:
-    import aiohttp
-except ImportError:
-    aiohttp = None
 
 # -----------------------------
 # Setup
@@ -109,12 +103,6 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # -----------------------------
-# Rate limiting
-# -----------------------------
-last_ai_request = {}  # user_id: timestamp
-AI_COOLDOWN = 3  # seconds between AI requests per user
-
-# -----------------------------
 # Persistent data storage
 # -----------------------------
 persistent_names = {}  # user_id: enforced_nickname
@@ -139,29 +127,123 @@ load_persistent_data()
 # -----------------------------
 def is_advanced_question(text: str) -> bool:
     """
-    Very restrictive question detection - only responds to clear questions
+    Advanced question detection system that analyzes multiple linguistic patterns
+    Returns True if the text is likely a question or request for help
     """
-    if not text or len(text.strip()) < 3:
+    if not text or len(text.strip()) < 2:
         return False
 
     text = text.strip().lower()
 
-    # 1. Must have question mark
+    # 1. Direct question marks
     if text.endswith('?'):
         return True
 
-    # 2. Only very clear question starters
-    clear_question_starters = ['how do', 'how can', 'what is', 'where is', 'why is', 'when is']
-    
-    if any(text.startswith(starter) for starter in clear_question_starters):
-        return True
-
-    # 3. Only respond to explicit help requests
-    explicit_help = [
-        'help me', 'please help', 'can you help', 'need help'
+    # 2. Question word starters (WH words, auxiliary verbs, modal verbs)
+    question_starters = [
+        # WH Questions
+        'who', 'what', 'when', 'where', 'why', 'how', 'which', 'whose', 'whom',
+        # Auxiliary verbs
+        'is', 'are', 'was', 'were', 'am', 'do', 'does', 'did', 'have', 'has', 'had',
+        'will', 'would', 'shall', 'should', 'can', 'could', 'may', 'might', 'must',
+        # Other question indicators
+        'anyone', 'anybody', 'someone', 'somebody'
     ]
 
-    if any(pattern in text for pattern in explicit_help):
+    first_word = text.split()[0] if text.split() else ""
+    if first_word in question_starters:
+        return True
+
+    # 3. Help/support request patterns
+    help_patterns = [
+        'help', 'issue', 'problem', 'trouble', 'error', 'bug', 'broken', 'not working',
+        'doesnt work', "doesn't work", 'cant', "can't", 'unable', 'stuck', 'confused',
+        'support', 'assist', 'guide', 'tutorial', 'explain', 'clarify'
+    ]
+
+    if any(pattern in text for pattern in help_patterns):
+        return True
+
+    # 4. Request patterns using regex
+    request_patterns = [
+        r'\b(please|pls)\b.*\b(help|show|tell|explain|guide)\b',
+        r'\bhow (to|do|can|should)\b',
+        r'\bwhat (is|are|does|do)\b',
+        r'\bwhere (is|are|can|do)\b',
+        r'\bwhy (is|are|does|do)\b',
+        r'\bwhen (is|are|does|do)\b',
+        r'\bwhich (is|are|does|do)\b',
+        r'\bwho (is|are|does|do)\b',
+        r'\b(can|could|would) (you|someone|anybody)\b',
+        r'\b(any|some)(one|body) know\b',
+        r'\bneed (help|assistance|support)\b',
+        r'\blooking for\b',
+        r'\btrying to\b.*\b(but|however|and)\b',
+        r'\bi (need|want|require)\b.*\b(help|info|information|guide)\b'
+    ]
+
+    for pattern in request_patterns:
+        if re.search(pattern, text):
+            return True
+
+    # 5. Imperative requests (commands that imply questions)
+    imperative_patterns = [
+        r'^(tell|show|explain|describe|list|give|provide)\s+me\b',
+        r'^(find|get|check|verify|confirm)\b',
+        r'^(teach|guide|walk)\s+me\b'
+    ]
+
+    for pattern in imperative_patterns:
+        if re.search(pattern, text):
+            return True
+
+    # 6. Uncertainty expressions that often indicate questions
+    uncertainty_patterns = [
+        'not sure', 'confused', 'dont understand', "don't understand", 'unclear',
+        'wondering', 'curious', 'question about', 'ask about', 'unsure'
+    ]
+
+    if any(pattern in text for pattern in uncertainty_patterns):
+        return True
+
+    # 7. Problem/issue indicators with contextual words
+    problem_contexts = [
+        'keeps', 'always', 'still', 'wont', "won't", 'fails', 'crashes',
+        'freezes', 'stops', 'slow', 'lag', 'glitch'
+    ]
+
+    problem_words = ['error', 'issue', 'problem', 'trouble', 'bug']
+
+    has_problem = any(word in text for word in problem_words)
+    has_context = any(context in text for context in problem_contexts)
+
+    if has_problem and has_context:
+        return True
+
+    # 8. Question-like sentence structures
+    question_structures = [
+        r'\bis there (a|an|any)\b',
+        r'\bdo (i|you|we|they)\b',
+        r'\bdoes (it|this|that|he|she)\b',
+        r'\bam i\b',
+        r'\bare (you|we|they)\b',
+        r'\bshould i\b',
+        r'\bwould (it|this|you)\b',
+        r'\bcould (it|this|you)\b'
+    ]
+
+    for structure in question_structures:
+        if re.search(structure, text):
+            return True
+
+    # 9. Conversational question indicators
+    conversation_patterns = [
+        'by any chance', 'happen to know', 'any idea', 'any thoughts',
+        'what do you think', 'in your opinion', 'suggestions', 'recommendations',
+        'advice', 'thoughts'
+    ]
+
+    if any(pattern in text for pattern in conversation_patterns):
         return True
 
     return False
@@ -184,39 +266,6 @@ def has_tellmeajoke_permission(member):
 
     return False
 
-def can_make_ai_request(user_id):
-    """Check if user can make an AI request (rate limiting)"""
-    current_time = time.time()
-    if user_id in last_ai_request:
-        if current_time - last_ai_request[user_id] < AI_COOLDOWN:
-            return False
-    last_ai_request[user_id] = current_time
-    return True
-
-async def discord_api_search(query: str) -> str:
-    """Search Discord API for relevant information"""
-    if not aiohttp:
-        return ""
-    
-    try:
-        # Simple Discord API search for public information
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
-            # Search Discord's public API docs or status
-            search_url = f"https://discord.com/api/v10/applications/@me"
-            headers = {
-                'Authorization': f'Bot {discord_token}',
-                'User-Agent': 'DiscordBot (https://discord.com, 1.0)'
-            }
-            
-            async with session.get(search_url, headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return f"**🤖 Discord API Info**: Connected as {data.get('name', 'Unknown')} (ID: {data.get('id', 'Unknown')})"
-    except Exception as e:
-        logger.error(f"Discord API search error: {e}")
-    
-    return ""
-
 def multi_source_search(query: str) -> str:
     """Search multiple real-time sources for accurate information with enhanced current events coverage"""
     results = []
@@ -230,53 +279,167 @@ def multi_source_search(query: str) -> str:
     ]
     is_current_event = any(keyword in query_lower for keyword in current_events_keywords)
 
-    # 1. News search with reduced timeout
+    # 1. PRIORITY: Enhanced news search for current events (if NewsAPI available)
     if news_client and (is_current_event or len(query.split()) <= 3):
         try:
-            news_results = news_client.get_everything(
-                q=query,
-                language='en',
-                page_size=2,
-                sort_by='publishedAt',
-                from_param=(datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-            )
-            
-            if news_results['articles']:
-                for article in news_results['articles'][:1]:
-                    published_date = article['publishedAt'][:10]
-                    source = article['source']['name']
-                    results.append(f"**📰 {article['title']}** ({source}, {published_date}): {article['description'][:100]}...")
-        except Exception as e:
-            logger.error(f"News search error: {e}")
+            search_strategies = [
+                {'q': query, 'sort_by': 'publishedAt'},
+                {'q': query, 'sort_by': 'relevancy'},
+            ]
 
-    # 2. Quick DuckDuckGo search
-    if DDGS and len(results) < 2:
+            words = query.split()
+            if len(words) >= 2 and not any(common in query_lower for common in ['how', 'what', 'when', 'where', 'why']):
+                person_query = ' '.join(words[:2])
+                search_strategies.append({'q': f'"{person_query}" news', 'sort_by': 'publishedAt'})
+
+            for strategy in search_strategies:
+                try:
+                    # Add timeout to news API calls
+                    import signal
+                    def timeout_handler(signum, frame):
+                        raise TimeoutError("News API timeout")
+
+                    signal.signal(signal.SIGALRM, timeout_handler)
+                    signal.alarm(5)  # 5 second timeout
+
+                    news_results = news_client.get_everything(
+                        language='en',
+                        page_size=3,
+                        from_param=(datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'),
+                        **strategy
+                    )
+
+                    signal.alarm(0)  # Cancel timeout
+
+                    if news_results['articles']:
+                        for article in news_results['articles'][:2]:
+                            published_date = article['publishedAt'][:10]
+                            source = article['source']['name']
+                            results.append(f"**📰 {article['title']}** ({source}, {published_date}): {article['description']}")
+                        break
+                except (TimeoutError, Exception) as strategy_error:
+                    signal.alarm(0)  # Cancel timeout
+                    logger.error(f"News strategy error: {strategy_error}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Enhanced news search error: {e}")
+
+    # 2. DuckDuckGo search (if available) - with timeout
+    if DDGS and len(results) < 3:
         try:
-            with DDGS() as ddgs:
-                web_results = list(ddgs.text(query, max_results=1))
-                for r in web_results:
-                    results.append(f"**🌐 {r['title']}**: {r['body'][:100]}...")
-        except Exception as e:
-            logger.error(f"DDG search error: {e}")
+            import signal
+            def timeout_handler(signum, frame):
+                raise TimeoutError("DuckDuckGo timeout")
 
-    # 3. Quick stock search
-    if yf and any(keyword in query_lower for keyword in ['stock', 'price', '$']):
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(8)  # 8 second timeout for DDG
+
+            with DDGS() as ddgs:
+                search_queries = [query]
+
+                if is_current_event:
+                    search_queries.extend([
+                        f"{query} 2024 2025",
+                        f"{query} news recent"
+                    ])
+
+                for search_query in search_queries[:2]:
+                    try:
+                        web_results = list(ddgs.text(search_query, max_results=2))
+                        for r in web_results:
+                            if len(results) < 4:
+                                results.append(f"**🌐 {r['title']}**: {r['body'][:150]}...")
+
+                        if len(results) >= 3:
+                            break
+
+                    except Exception as ddg_error:
+                        logger.error(f"DDG query '{search_query}' error: {ddg_error}")
+                        continue
+
+            signal.alarm(0)  # Cancel timeout
+
+        except (TimeoutError, Exception) as e:
+            signal.alarm(0)  # Cancel timeout
+            logger.error(f"DuckDuckGo search error: {e}")
+
+    # 3. Basic web scraping fallback - with timeout
+    if len(results) < 2:
+        try:
+            search_url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+
+            response = requests.get(search_url, headers=headers, timeout=5)
+            if response.status_code == 200 and BeautifulSoup:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                search_divs = soup.find_all('div', class_='g')[:2]
+                for div in search_divs:
+                    title_elem = div.find('h3')
+                    snippet_elem = div.find('span')
+                    if title_elem and snippet_elem:
+                        title = title_elem.get_text()
+                        snippet = snippet_elem.get_text()
+                        if len(title) > 10 and len(snippet) > 20:
+                            results.append(f"**🔍 {title}**: {snippet[:150]}...")
+
+        except Exception as e:
+            logger.error(f"Basic web search error: {e}")
+
+    # 4. Stock search (if yfinance available) - with timeout
+    if yf and not is_current_event and any(keyword in query_lower for keyword in ['stock', 'price', 'shares', 'market', '$', 'nasdaq', 'dow', 'sp500']):
         try:
             words = query.upper().split()
             for word in words:
                 if len(word) <= 5 and word.isalpha():
                     try:
                         ticker = yf.Ticker(word)
+                        # Set timeout for yfinance
+                        import signal
+                        def timeout_handler(signum, frame):
+                            raise TimeoutError("YFinance timeout")
+
+                        signal.signal(signal.SIGALRM, timeout_handler)
+                        signal.alarm(3)  # 3 second timeout
+
                         info = ticker.info
                         current_price = info.get('currentPrice') or info.get('regularMarketPrice')
+
+                        signal.alarm(0)  # Cancel timeout
+
                         if current_price:
                             company_name = info.get('shortName', word)
                             results.append(f"**💹 {company_name} ({word})**: ${current_price:.2f}")
                             break
-                    except Exception:
+                    except (TimeoutError, Exception):
+                        signal.alarm(0)  # Cancel timeout
                         continue
         except Exception as e:
             logger.error(f"Stock search error: {e}")
+
+    # 5. Wikipedia search (if available) - with timeout
+    if wikipedia and (not is_current_event or len(results) < 2):
+        try:
+            import signal
+            def timeout_handler(signum, frame):
+                raise TimeoutError("Wikipedia timeout")
+
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(4)  # 4 second timeout
+
+            wiki_results = wikipedia.search(query, results=1)
+            if wiki_results:
+                page = wikipedia.page(wiki_results[0])
+                wiki_summary = wikipedia.summary(wiki_results[0], sentences=2)
+                results.append(f"**📖 {page.title}**: {wiki_summary}")
+
+            signal.alarm(0)  # Cancel timeout
+
+        except (TimeoutError, Exception):
+            signal.alarm(0)  # Cancel timeout
+            pass
 
     return "\n\n".join(results) if results else "I couldn't find reliable information for this query right now. Please try rephrasing your question or try again later."
 
@@ -395,18 +558,17 @@ def get_knowledge_response(message_content):
     if (has_macro and has_where) or any(pattern in text for pattern in macro_patterns):
         return "**Fisch Macro:** https://discord.com/channels/1341949236471926804/1413837110770925578/1417999310443905116"
 
-    # Enhanced config location detection for rod configs - only respond to actual questions
-    config_keywords = ['config', 'configs', 'settings']
-    rod_keywords = ['rod', 'rods']
-    
-    # Only respond if it's actually a question about configs
-    # Must have question indicators AND config/rod keywords
+    # Enhanced config location detection for rod configs
+    config_keywords = ['config', 'configs', 'rod', 'rods', 'settings']
+    fisch_keywords = ['fisch', 'macro']
+
+    # Check if text contains config-related words
     has_config = any(keyword in text for keyword in config_keywords)
-    has_rod = any(keyword in text for keyword in rod_keywords)
-    has_question_word = any(keyword in text for keyword in where_keywords + ['how', 'what'])
-    
-    # Specific question patterns about rod configs
-    config_question_patterns = [
+    has_fisch = any(keyword in text for keyword in fisch_keywords)
+    has_where_config = any(keyword in text for keyword in where_keywords)
+
+    # Also check for specific patterns
+    config_patterns = [
         'where can i find the config',
         'where can i find the fisch config',
         'where fisch config',
@@ -417,15 +579,10 @@ def get_knowledge_response(message_content):
         'configs for rod',
         'fisch rod config',
         'macro config',
-        'where rod settings',
-        'how to config',
-        'what config',
-        'need config',
-        'find config'
+        'where rod settings'
     ]
 
-    # Only show config link if it's clearly a question about configs
-    if (has_config and (has_question_word or text.endswith('?'))) or any(pattern in text for pattern in config_question_patterns):
+    if ((has_config and has_fisch) or (has_config and has_where_config)) or any(pattern in text for pattern in config_patterns):
         return "**Fisch Rod Configs:** https://discord.com/channels/1341949236471926804/1411335491457913014"
 
     # Mango/Fisch macro location
@@ -525,11 +682,6 @@ async def askbloom_command(interaction: discord.Interaction, question: str):
         await interaction.response.send_message("❌ AI service not available.", ephemeral=True)
         return
 
-    # Rate limiting check
-    if not can_make_ai_request(interaction.user.id):
-        await interaction.response.send_message("⏱️ Please wait a few seconds before asking another question!", ephemeral=True)
-        return
-
     # Content filter
     question_lower = question.lower()
     banned_words = ['racist', 'racism', 'nazi', 'hitler', 'slur', 'hate speech', 'nigger', 'faggot']
@@ -549,50 +701,64 @@ async def askbloom_command(interaction: discord.Interaction, question: str):
             # Use existing knowledge base for Fisch-related questions
             await interaction.followup.send(knowledge_response)
         else:
-            try:
-                # Quick Discord API search first
-                discord_info = await discord_api_search(question)
-                
-                # Run optimized search with shorter timeout
-                search_results = multi_source_search(question)
-                
-                # Combine Discord info with search results
-                if discord_info:
-                    search_results = discord_info + "\n\n" + search_results
-                
-                if not search_results or search_results.strip() == "":
-                    await interaction.followup.send("No information found. Please try rephrasing your question.")
-                    return
+            # Add timeout wrapper for the entire search process
+            async def search_with_timeout():
+                try:
+                    # Run search in a separate thread to avoid blocking
+                    import concurrent.futures
+                    import threading
 
-                prompt = f"""You are Bloom, a Discord bot assistant. Analyze the search results and provide a direct, accurate answer.
+                    def run_search():
+                        return multi_source_search(question)
+
+                    # Use ThreadPoolExecutor with timeout
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(run_search)
+                        try:
+                            search_results = future.result(timeout=15)  # 15 second total timeout
+                        except concurrent.futures.TimeoutError:
+                            return "Search timed out. Please try a simpler question or try again later."
+
+                    if not search_results or search_results.strip() == "":
+                        return "No information found. Please try rephrasing your question."
+
+                    prompt = f"""You are Bloom, a Discord bot assistant. Analyze the search results and provide a direct, accurate answer.
+
+CRITICAL ANALYSIS REQUIRED:
+- Question assumptions in the query if data contradicts them
+- Identify potential biases in sources
+- Offer counterpoints when evidence supports them
+- Don't sugarcoat - be direct about facts even if uncomfortable
+- Challenge popular misconceptions with evidence
 
 SEARCH RESULTS:
 {search_results}
 
 USER QUESTION: {question}
 
-Provide a helpful response under 1800 characters. Be direct and informative."""
+Provide a substantive, evidence-based response under 1800 characters. Focus on accuracy over politeness. If sources conflict, explain why. If the question contains false assumptions, correct them directly."""
 
-                try:
-                    response = client.generate_content(prompt)
-                    if response.text:
-                        answer = response.text.strip()
-                        if len(answer) > 1800:
-                            answer = answer[:1797] + "..."
-                        await interaction.followup.send(answer)
-                    else:
-                        await interaction.followup.send("❌ Couldn't generate response. Try again!")
-                except Exception as ai_error:
-                    error_str = str(ai_error)
-                    logger.error(f"AI generation error: {ai_error}")
-                    if "429" in error_str or "Too Many Requests" in error_str:
-                        await interaction.followup.send("⏱️ AI service is currently rate limited. Please try again in a few minutes!")
-                    else:
-                        await interaction.followup.send("❌ AI service temporarily unavailable. Try again!")
+                    # Add timeout for AI generation
+                    try:
+                        response = client.generate_content(prompt)
+                        if response.text:
+                            answer = response.text.strip()
+                            if len(answer) > 1800:
+                                answer = answer[:1797] + "..."
+                            return answer
+                        else:
+                            return "❌ Couldn't generate response. Try again!"
+                    except Exception as ai_error:
+                        logger.error(f"AI generation error: {ai_error}")
+                        return "❌ AI service temporarily unavailable. Try again!"
 
-            except Exception as search_error:
-                logger.error(f"Search error: {search_error}")
-                await interaction.followup.send("❌ Search failed. Try a simpler question or try again later.")
+                except Exception as search_error:
+                    logger.error(f"Search error: {search_error}")
+                    return "❌ Search failed. Try a simpler question or try again later."
+
+            # Run the search with timeout
+            result = await search_with_timeout()
+            await interaction.followup.send(result)
 
     except asyncio.TimeoutError:
         logger.error("AskBloom timeout")
@@ -699,11 +865,6 @@ async def tellmeajoke_command(interaction: discord.Interaction, context: str):
         await interaction.response.send_message("❌ AI service not available.", ephemeral=True)
         return
 
-    # Rate limiting check
-    if not can_make_ai_request(interaction.user.id):
-        await interaction.response.send_message("⏱️ Please wait a few seconds before requesting another joke!", ephemeral=True)
-        return
-
     # Content filter
     context_lower = context.lower()
     banned_words = ['racist', 'racism', 'nazi', 'hitler', 'slur', 'hate speech', 'nigger', 'faggot']
@@ -727,12 +888,8 @@ Make it witty and humorous but not offensive or mean-spirited. Keep it under 500
             await interaction.response.send_message("❌ Couldn't generate a joke. Try again!", ephemeral=True)
 
     except Exception as e:
-        error_str = str(e)
         logger.error(f"Tellmeajoke error: {e}")
-        if "429" in error_str or "Too Many Requests" in error_str:
-            await interaction.response.send_message("⏱️ AI service is currently rate limited. Please try again in a few minutes!", ephemeral=True)
-        else:
-            await interaction.response.send_message("❌ Something went wrong. Try again!", ephemeral=True)
+        await interaction.response.send_message("❌ Something went wrong. Try again!", ephemeral=True)
 
 @bot.tree.command(name="whatisthisserverabout", description="Learn about this Discord server")
 async def whatisthisserverabout_command(interaction: discord.Interaction):
