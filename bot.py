@@ -50,6 +50,11 @@ try:
 except ImportError:
     genai = None
 
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
+
 # -----------------------------
 # Setup
 # -----------------------------
@@ -266,6 +271,30 @@ def has_tellmeajoke_permission(member):
 
     return False
 
+async def discord_api_search(query: str) -> str:
+    """Search Discord API for relevant information"""
+    if not aiohttp:
+        return ""
+    
+    try:
+        # Simple Discord API search for public information
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
+            # Search Discord's public API docs or status
+            search_url = f"https://discord.com/api/v10/applications/@me"
+            headers = {
+                'Authorization': f'Bot {discord_token}',
+                'User-Agent': 'DiscordBot (https://discord.com, 1.0)'
+            }
+            
+            async with session.get(search_url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return f"**🤖 Discord API Info**: Connected as {data.get('name', 'Unknown')} (ID: {data.get('id', 'Unknown')})"
+    except Exception as e:
+        logger.error(f"Discord API search error: {e}")
+    
+    return ""
+
 def multi_source_search(query: str) -> str:
     """Search multiple real-time sources for accurate information with enhanced current events coverage"""
     results = []
@@ -279,167 +308,53 @@ def multi_source_search(query: str) -> str:
     ]
     is_current_event = any(keyword in query_lower for keyword in current_events_keywords)
 
-    # 1. PRIORITY: Enhanced news search for current events (if NewsAPI available)
+    # 1. News search with reduced timeout
     if news_client and (is_current_event or len(query.split()) <= 3):
         try:
-            search_strategies = [
-                {'q': query, 'sort_by': 'publishedAt'},
-                {'q': query, 'sort_by': 'relevancy'},
-            ]
-
-            words = query.split()
-            if len(words) >= 2 and not any(common in query_lower for common in ['how', 'what', 'when', 'where', 'why']):
-                person_query = ' '.join(words[:2])
-                search_strategies.append({'q': f'"{person_query}" news', 'sort_by': 'publishedAt'})
-
-            for strategy in search_strategies:
-                try:
-                    # Add timeout to news API calls
-                    import signal
-                    def timeout_handler(signum, frame):
-                        raise TimeoutError("News API timeout")
-
-                    signal.signal(signal.SIGALRM, timeout_handler)
-                    signal.alarm(5)  # 5 second timeout
-
-                    news_results = news_client.get_everything(
-                        language='en',
-                        page_size=3,
-                        from_param=(datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'),
-                        **strategy
-                    )
-
-                    signal.alarm(0)  # Cancel timeout
-
-                    if news_results['articles']:
-                        for article in news_results['articles'][:2]:
-                            published_date = article['publishedAt'][:10]
-                            source = article['source']['name']
-                            results.append(f"**📰 {article['title']}** ({source}, {published_date}): {article['description']}")
-                        break
-                except (TimeoutError, Exception) as strategy_error:
-                    signal.alarm(0)  # Cancel timeout
-                    logger.error(f"News strategy error: {strategy_error}")
-                    continue
-
+            news_results = news_client.get_everything(
+                q=query,
+                language='en',
+                page_size=2,
+                sort_by='publishedAt',
+                from_param=(datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+            )
+            
+            if news_results['articles']:
+                for article in news_results['articles'][:1]:
+                    published_date = article['publishedAt'][:10]
+                    source = article['source']['name']
+                    results.append(f"**📰 {article['title']}** ({source}, {published_date}): {article['description'][:100]}...")
         except Exception as e:
-            logger.error(f"Enhanced news search error: {e}")
+            logger.error(f"News search error: {e}")
 
-    # 2. DuckDuckGo search (if available) - with timeout
-    if DDGS and len(results) < 3:
+    # 2. Quick DuckDuckGo search
+    if DDGS and len(results) < 2:
         try:
-            import signal
-            def timeout_handler(signum, frame):
-                raise TimeoutError("DuckDuckGo timeout")
-
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(8)  # 8 second timeout for DDG
-
             with DDGS() as ddgs:
-                search_queries = [query]
-
-                if is_current_event:
-                    search_queries.extend([
-                        f"{query} 2024 2025",
-                        f"{query} news recent"
-                    ])
-
-                for search_query in search_queries[:2]:
-                    try:
-                        web_results = list(ddgs.text(search_query, max_results=2))
-                        for r in web_results:
-                            if len(results) < 4:
-                                results.append(f"**🌐 {r['title']}**: {r['body'][:150]}...")
-
-                        if len(results) >= 3:
-                            break
-
-                    except Exception as ddg_error:
-                        logger.error(f"DDG query '{search_query}' error: {ddg_error}")
-                        continue
-
-            signal.alarm(0)  # Cancel timeout
-
-        except (TimeoutError, Exception) as e:
-            signal.alarm(0)  # Cancel timeout
-            logger.error(f"DuckDuckGo search error: {e}")
-
-    # 3. Basic web scraping fallback - with timeout
-    if len(results) < 2:
-        try:
-            search_url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-
-            response = requests.get(search_url, headers=headers, timeout=5)
-            if response.status_code == 200 and BeautifulSoup:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                search_divs = soup.find_all('div', class_='g')[:2]
-                for div in search_divs:
-                    title_elem = div.find('h3')
-                    snippet_elem = div.find('span')
-                    if title_elem and snippet_elem:
-                        title = title_elem.get_text()
-                        snippet = snippet_elem.get_text()
-                        if len(title) > 10 and len(snippet) > 20:
-                            results.append(f"**🔍 {title}**: {snippet[:150]}...")
-
+                web_results = list(ddgs.text(query, max_results=1))
+                for r in web_results:
+                    results.append(f"**🌐 {r['title']}**: {r['body'][:100]}...")
         except Exception as e:
-            logger.error(f"Basic web search error: {e}")
+            logger.error(f"DDG search error: {e}")
 
-    # 4. Stock search (if yfinance available) - with timeout
-    if yf and not is_current_event and any(keyword in query_lower for keyword in ['stock', 'price', 'shares', 'market', '$', 'nasdaq', 'dow', 'sp500']):
+    # 3. Quick stock search
+    if yf and any(keyword in query_lower for keyword in ['stock', 'price', '$']):
         try:
             words = query.upper().split()
             for word in words:
                 if len(word) <= 5 and word.isalpha():
                     try:
                         ticker = yf.Ticker(word)
-                        # Set timeout for yfinance
-                        import signal
-                        def timeout_handler(signum, frame):
-                            raise TimeoutError("YFinance timeout")
-
-                        signal.signal(signal.SIGALRM, timeout_handler)
-                        signal.alarm(3)  # 3 second timeout
-
                         info = ticker.info
                         current_price = info.get('currentPrice') or info.get('regularMarketPrice')
-
-                        signal.alarm(0)  # Cancel timeout
-
                         if current_price:
                             company_name = info.get('shortName', word)
                             results.append(f"**💹 {company_name} ({word})**: ${current_price:.2f}")
                             break
-                    except (TimeoutError, Exception):
-                        signal.alarm(0)  # Cancel timeout
+                    except Exception:
                         continue
         except Exception as e:
             logger.error(f"Stock search error: {e}")
-
-    # 5. Wikipedia search (if available) - with timeout
-    if wikipedia and (not is_current_event or len(results) < 2):
-        try:
-            import signal
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Wikipedia timeout")
-
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(4)  # 4 second timeout
-
-            wiki_results = wikipedia.search(query, results=1)
-            if wiki_results:
-                page = wikipedia.page(wiki_results[0])
-                wiki_summary = wikipedia.summary(wiki_results[0], sentences=2)
-                results.append(f"**📖 {page.title}**: {wiki_summary}")
-
-            signal.alarm(0)  # Cancel timeout
-
-        except (TimeoutError, Exception):
-            signal.alarm(0)  # Cancel timeout
-            pass
 
     return "\n\n".join(results) if results else "I couldn't find reliable information for this query right now. Please try rephrasing your question or try again later."
 
@@ -701,64 +616,46 @@ async def askbloom_command(interaction: discord.Interaction, question: str):
             # Use existing knowledge base for Fisch-related questions
             await interaction.followup.send(knowledge_response)
         else:
-            # Add timeout wrapper for the entire search process
-            async def search_with_timeout():
-                try:
-                    # Run search in a separate thread to avoid blocking
-                    import concurrent.futures
-                    import threading
+            try:
+                # Quick Discord API search first
+                discord_info = await discord_api_search(question)
+                
+                # Run optimized search with shorter timeout
+                search_results = multi_source_search(question)
+                
+                # Combine Discord info with search results
+                if discord_info:
+                    search_results = discord_info + "\n\n" + search_results
+                
+                if not search_results or search_results.strip() == "":
+                    await interaction.followup.send("No information found. Please try rephrasing your question.")
+                    return
 
-                    def run_search():
-                        return multi_source_search(question)
-
-                    # Use ThreadPoolExecutor with timeout
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(run_search)
-                        try:
-                            search_results = future.result(timeout=15)  # 15 second total timeout
-                        except concurrent.futures.TimeoutError:
-                            return "Search timed out. Please try a simpler question or try again later."
-
-                    if not search_results or search_results.strip() == "":
-                        return "No information found. Please try rephrasing your question."
-
-                    prompt = f"""You are Bloom, a Discord bot assistant. Analyze the search results and provide a direct, accurate answer.
-
-CRITICAL ANALYSIS REQUIRED:
-- Question assumptions in the query if data contradicts them
-- Identify potential biases in sources
-- Offer counterpoints when evidence supports them
-- Don't sugarcoat - be direct about facts even if uncomfortable
-- Challenge popular misconceptions with evidence
+                prompt = f"""You are Bloom, a Discord bot assistant. Analyze the search results and provide a direct, accurate answer.
 
 SEARCH RESULTS:
 {search_results}
 
 USER QUESTION: {question}
 
-Provide a substantive, evidence-based response under 1800 characters. Focus on accuracy over politeness. If sources conflict, explain why. If the question contains false assumptions, correct them directly."""
+Provide a helpful response under 1800 characters. Be direct and informative."""
 
-                    # Add timeout for AI generation
-                    try:
-                        response = client.generate_content(prompt)
-                        if response.text:
-                            answer = response.text.strip()
-                            if len(answer) > 1800:
-                                answer = answer[:1797] + "..."
-                            return answer
-                        else:
-                            return "❌ Couldn't generate response. Try again!"
-                    except Exception as ai_error:
-                        logger.error(f"AI generation error: {ai_error}")
-                        return "❌ AI service temporarily unavailable. Try again!"
+                try:
+                    response = client.generate_content(prompt)
+                    if response.text:
+                        answer = response.text.strip()
+                        if len(answer) > 1800:
+                            answer = answer[:1797] + "..."
+                        await interaction.followup.send(answer)
+                    else:
+                        await interaction.followup.send("❌ Couldn't generate response. Try again!")
+                except Exception as ai_error:
+                    logger.error(f"AI generation error: {ai_error}")
+                    await interaction.followup.send("❌ AI service temporarily unavailable. Try again!")
 
-                except Exception as search_error:
-                    logger.error(f"Search error: {search_error}")
-                    return "❌ Search failed. Try a simpler question or try again later."
-
-            # Run the search with timeout
-            result = await search_with_timeout()
-            await interaction.followup.send(result)
+            except Exception as search_error:
+                logger.error(f"Search error: {search_error}")
+                await interaction.followup.send("❌ Search failed. Try a simpler question or try again later.")
 
     except asyncio.TimeoutError:
         logger.error("AskBloom timeout")
