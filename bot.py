@@ -139,123 +139,29 @@ load_persistent_data()
 # -----------------------------
 def is_advanced_question(text: str) -> bool:
     """
-    Advanced question detection system that analyzes multiple linguistic patterns
-    Returns True if the text is likely a question or request for help
+    Very restrictive question detection - only responds to clear questions
     """
-    if not text or len(text.strip()) < 2:
+    if not text or len(text.strip()) < 3:
         return False
 
     text = text.strip().lower()
 
-    # 1. Direct question marks
+    # 1. Must have question mark
     if text.endswith('?'):
         return True
 
-    # 2. Question word starters (WH words, auxiliary verbs, modal verbs)
-    question_starters = [
-        # WH Questions
-        'who', 'what', 'when', 'where', 'why', 'how', 'which', 'whose', 'whom',
-        # Auxiliary verbs
-        'is', 'are', 'was', 'were', 'am', 'do', 'does', 'did', 'have', 'has', 'had',
-        'will', 'would', 'shall', 'should', 'can', 'could', 'may', 'might', 'must',
-        # Other question indicators
-        'anyone', 'anybody', 'someone', 'somebody'
-    ]
-
-    first_word = text.split()[0] if text.split() else ""
-    if first_word in question_starters:
+    # 2. Only very clear question starters
+    clear_question_starters = ['how do', 'how can', 'what is', 'where is', 'why is', 'when is']
+    
+    if any(text.startswith(starter) for starter in clear_question_starters):
         return True
 
-    # 3. Help/support request patterns
-    help_patterns = [
-        'help', 'issue', 'problem', 'trouble', 'error', 'bug', 'broken', 'not working',
-        'doesnt work', "doesn't work", 'cant', "can't", 'unable', 'stuck', 'confused',
-        'support', 'assist', 'guide', 'tutorial', 'explain', 'clarify'
+    # 3. Only respond to explicit help requests
+    explicit_help = [
+        'help me', 'please help', 'can you help', 'need help'
     ]
 
-    if any(pattern in text for pattern in help_patterns):
-        return True
-
-    # 4. Request patterns using regex
-    request_patterns = [
-        r'\b(please|pls)\b.*\b(help|show|tell|explain|guide)\b',
-        r'\bhow (to|do|can|should)\b',
-        r'\bwhat (is|are|does|do)\b',
-        r'\bwhere (is|are|can|do)\b',
-        r'\bwhy (is|are|does|do)\b',
-        r'\bwhen (is|are|does|do)\b',
-        r'\bwhich (is|are|does|do)\b',
-        r'\bwho (is|are|does|do)\b',
-        r'\b(can|could|would) (you|someone|anybody)\b',
-        r'\b(any|some)(one|body) know\b',
-        r'\bneed (help|assistance|support)\b',
-        r'\blooking for\b',
-        r'\btrying to\b.*\b(but|however|and)\b',
-        r'\bi (need|want|require)\b.*\b(help|info|information|guide)\b'
-    ]
-
-    for pattern in request_patterns:
-        if re.search(pattern, text):
-            return True
-
-    # 5. Imperative requests (commands that imply questions)
-    imperative_patterns = [
-        r'^(tell|show|explain|describe|list|give|provide)\s+me\b',
-        r'^(find|get|check|verify|confirm)\b',
-        r'^(teach|guide|walk)\s+me\b'
-    ]
-
-    for pattern in imperative_patterns:
-        if re.search(pattern, text):
-            return True
-
-    # 6. Uncertainty expressions that often indicate questions
-    uncertainty_patterns = [
-        'not sure', 'confused', 'dont understand', "don't understand", 'unclear',
-        'wondering', 'curious', 'question about', 'ask about', 'unsure'
-    ]
-
-    if any(pattern in text for pattern in uncertainty_patterns):
-        return True
-
-    # 7. Problem/issue indicators with contextual words
-    problem_contexts = [
-        'keeps', 'always', 'still', 'wont', "won't", 'fails', 'crashes',
-        'freezes', 'stops', 'slow', 'lag', 'glitch'
-    ]
-
-    problem_words = ['error', 'issue', 'problem', 'trouble', 'bug']
-
-    has_problem = any(word in text for word in problem_words)
-    has_context = any(context in text for context in problem_contexts)
-
-    if has_problem and has_context:
-        return True
-
-    # 8. Question-like sentence structures
-    question_structures = [
-        r'\bis there (a|an|any)\b',
-        r'\bdo (i|you|we|they)\b',
-        r'\bdoes (it|this|that|he|she)\b',
-        r'\bam i\b',
-        r'\bare (you|we|they)\b',
-        r'\bshould i\b',
-        r'\bwould (it|this|you)\b',
-        r'\bcould (it|this|you)\b'
-    ]
-
-    for structure in question_structures:
-        if re.search(structure, text):
-            return True
-
-    # 9. Conversational question indicators
-    conversation_patterns = [
-        'by any chance', 'happen to know', 'any idea', 'any thoughts',
-        'what do you think', 'in your opinion', 'suggestions', 'recommendations',
-        'advice', 'thoughts'
-    ]
-
-    if any(pattern in text for pattern in conversation_patterns):
+    if any(pattern in text for pattern in explicit_help):
         return True
 
     return False
