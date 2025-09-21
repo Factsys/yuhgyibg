@@ -58,7 +58,9 @@ logger = logging.getLogger(__name__)
 
 # Admin controls - Users who can use restricted commands
 ADMIN_USER_IDS = [
-    1334138321412296725  # Your ID - add more IDs here separated by commas
+    1334138321412296725,  # Your ID - add more IDs here separated by commas
+    # 1234567890123456789,  # Example: Add more user IDs like this
+    # 9876543210987654321   # Example: Another user ID
 ]
 
 # Role ID that can use /tellmeajoke command
@@ -465,16 +467,6 @@ def get_knowledge_response(message_content):
     """Get response based on new knowledge base"""
     text = message_content.lower()
 
-    # Grox response - works in any sentence
-    if 'grox' in text:
-        grox_responses = [
-            "Kill grox",
-            "Nobody asked grox",
-            "Grox needs to disappear",
-            "Imagine being grox 💀",
-            "Grox = L + ratio + touch grass"
-        ]
-        return random.choice(grox_responses)
 
     # Andrew joke response - only for "who is andrew"
     if 'who is andrew' in text:
@@ -490,7 +482,7 @@ def get_knowledge_response(message_content):
                 ]
 
                 selected_category = random.choice(joke_categories)
-                joke_prompt = f"""Create a harsh but funny two-line roast about Andrew focusing on {selected_category}. Make it brutal but playful. Include an emoji at the end. Be creative and unique."""
+                joke_prompt = f"""Create a savage, ruthless roast about Andrew focusing on {selected_category}. Make it brutal, creative and unique - absolutely demolish him with clever insults. Include an emoji at the end."""
 
                 response = client.generate_content(joke_prompt)
                 if response.text:
@@ -678,6 +670,11 @@ async def on_message(message):
 @bot.tree.command(name="askbloom", description="Ask Bloom anything with web search for accurate info")
 @app_commands.describe(question="Your question - I'll search the web for current information!")
 async def askbloom_command(interaction: discord.Interaction, question: str):
+    # Check if user is authorized admin
+    if not is_admin_user(interaction.user.id):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+        
     if not client:
         await interaction.response.send_message("❌ AI service not available.", ephemeral=True)
         return
@@ -856,8 +853,8 @@ async def saywb_command(interaction: discord.Interaction, title: str, text: str,
 @bot.tree.command(name="tellmeajoke", description="Get a custom AI-generated joke")
 @app_commands.describe(context="Context for the joke (e.g., 'say something bad about my name')")
 async def tellmeajoke_command(interaction: discord.Interaction, context: str):
-    # Check permissions
-    if not has_tellmeajoke_permission(interaction.user):
+    # Check if user is authorized admin
+    if not is_admin_user(interaction.user.id):
         await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
         return
 
@@ -874,9 +871,9 @@ async def tellmeajoke_command(interaction: discord.Interaction, context: str):
         return
 
     try:
-        prompt = f"""You are Bloom, a Discord bot with a sharp sense of humor. Create a funny, clever joke based on this context: "{context}"
+        prompt = f"""You are Bloom, a Discord bot with a savage sense of humor. Create a brutal, ruthlessly funny joke based on this context: "{context}"
 
-Make it witty and humorous but not offensive or mean-spirited. Keep it under 500 characters and add an appropriate emoji at the end. Be creative and entertaining!"""
+Make it brutal, creative and unique - absolutely demolish the target with clever, devastating humor. Keep it under 500 characters and add an appropriate emoji at the end. Be creative and savage!"""
 
         response = client.generate_content(prompt)
         if response.text:
@@ -893,6 +890,11 @@ Make it witty and humorous but not offensive or mean-spirited. Keep it under 500
 
 @bot.tree.command(name="whatisthisserverabout", description="Learn about this Discord server")
 async def whatisthisserverabout_command(interaction: discord.Interaction):
+    # Check if user is authorized admin
+    if not is_admin_user(interaction.user.id):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+        
     server_responses = [
         "🥭 **This server is all about mangoes and tiny tasks!** We're building something amazing here - this server will soon be a big Discord server as we have big plans! Join us on this exciting journey! 🚀",
 
