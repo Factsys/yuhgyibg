@@ -2,6 +2,8 @@ import os
 import sys
 import json
 from unittest.mock import MagicMock
+from datetime import datetime, timedelta
+import re
 
 # Mock audioop module before importing discord to prevent ModuleNotFoundError
 sys.modules['audioop'] = MagicMock()
@@ -11,13 +13,42 @@ from discord.ext import commands
 from discord import app_commands
 import asyncio
 import logging
-from datetime import datetime
-import difflib
 import random
 import requests
-import trafilatura
-from bs4 import BeautifulSoup
-from google import genai
+try:
+    import trafilatura
+except ImportError:
+    trafilatura = None
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    DDGS = None
+
+try:
+    import wikipedia
+except ImportError:
+    wikipedia = None
+
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
+
+try:
+    from newsapi import NewsApiClient
+except ImportError:
+    NewsApiClient = None
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 # -----------------------------
 # Setup
@@ -25,8 +56,28 @@ from google import genai
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-discord_token = os.environ.get("TOKEN")
-gemini_key = os.environ.get("GEMINI_API_KEY")
+# Admin controls - Users who can use restricted commands
+ADMIN_USER_IDS = [
+    1334138321412296725  # Your ID - add more IDs here separated by commas
+]
+
+# Role ID that can use /tellmeajoke command
+TELLMEAJOKE_ROLE_ID = 1234567890123456789  # Replace with actual role ID
+
+discord_token = os.getenv('TOKEN')
+gemini_key = os.getenv('API')
+news_api_key = os.getenv('NEWS_API_KEY')  # Get from newsapi.org
+
+# Initialize NewsAPI client if key exists
+news_client = None
+if news_api_key and NewsApiClient:
+    try:
+        news_client = NewsApiClient(api_key=news_api_key)
+        logger.info("✅ NewsAPI client initialized")
+    except Exception as e:
+        logger.error(f"❌ NewsAPI init failed: {e}")
+elif not NewsApiClient:
+    logger.info("ℹ️ NewsAPI not available (package not installed)")
 
 if not discord_token:
     logger.warning("⚠️ TOKEN not set!")
@@ -37,202 +88,465 @@ if not gemini_key:
 client = None
 if gemini_key:
     try:
-        client = genai.Client(api_key=gemini_key)
+        genai.configure(api_key=gemini_key)
+        client = genai.GenerativeModel('gemini-1.5-flash')
         logger.info("✅ Gemini client initialized")
     except Exception as e:
         logger.error(f"❌ Gemini init failed: {e}")
 
-
 # -----------------------------
 # Bot setup
 # -----------------------------
-intents = discord.Intents.none()
-intents.guilds = True
-intents.guild_messages = True
+intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # -----------------------------
-# Learning Data
+# Persistent data storage
 # -----------------------------
-class LearningData:
-    def __init__(self):
-        self.conversations = []
-        self.learned_content = []
-    
-    def add_conversation(self, user_id, question, answer):
-        self.conversations.append({
-            "user_id": user_id,
-            "question": question,
-            "answer": answer,
-            "timestamp": datetime.now().isoformat()
-        })
-    
-    def add_learned_content(self, url, title, content, user_id):
-        self.learned_content.append({
-            "url": url,
-            "title": title,
-            "content": content,
-            "learned_by": user_id,
-            "timestamp": datetime.now().isoformat()
-        })
-    
-    def get_learned_content_summary(self):
-        if not self.learned_content:
-            return ""
-        summary = "LEARNED DOCUMENTS:\n\n"
-        for doc in self.learned_content[-10:]:
-            summary += f"Title: {doc['title']}\n"
-            summary += f"Content: {doc['content'][:500]}...\n"
-            summary += f"Source: {doc['url']}\n\n"
-        return summary
+persistent_names = {}  # user_id: enforced_nickname
 
-learning_data = LearningData()
+def load_persistent_data():
+    global persistent_names
+    try:
+        with open('persistent_data.json', 'r') as f:
+            data = json.load(f)
+            persistent_names = data.get('names', {})
+    except FileNotFoundError:
+        pass
+
+def save_persistent_data():
+    with open('persistent_data.json', 'w') as f:
+        json.dump({'names': persistent_names}, f)
+
+load_persistent_data()
 
 # -----------------------------
-# Load FAQ Documents
+# Helper functions
 # -----------------------------
-faq_docs = {}
-try:
-    with open('learned_docs.json', 'r', encoding='utf-8') as f:
-        faq_docs = json.load(f)
-    logger.info(f"✅ Loaded {len(faq_docs)} FAQ documents")
-except FileNotFoundError:
-    logger.warning("⚠️ FAQ documents not found")
-except Exception as e:
-    logger.error(f"❌ Failed to load FAQ documents: {e}")
-
-# -----------------------------
-# Hehe feature
-# -----------------------------
-
-# -----------------------------
-# KB fuzzy matching
-# -----------------------------
-def fuzzy_match(word, keywords, cutoff=0.7):
-    for kw in keywords:
-        ratio = difflib.SequenceMatcher(None, word, kw).ratio()
-        if ratio >= cutoff:
-            return True
-    return False
-
-def search_faq_docs(query: str):
-    """Search FAQ documents for relevant content"""
-    if not faq_docs:
-        return None
+def is_advanced_question(text: str) -> bool:
+    """
+    Advanced question detection system that analyzes multiple linguistic patterns
+    Returns True if the text is likely a question or request for help
+    """
+    if not text or len(text.strip()) < 2:
+        return False
     
-    query_lower = query.lower()
+    text = text.strip().lower()
     
-    # Domain-specific keywords that must be present
-    domain_keywords = [
-        'roblox', 'camera', 'zoom', 'shake', 'macro', 'bloxlink', 'helper', 
-        'deadzone', 'tolerance', 'autohotkey', 'fisch', 'graphics', 'navigation',
-        'failsafe', 'restart', 'delay', 'cast', 'rod', 'bait', 'microsoft',
-        'web', 'transparent', 'head', 'mouse', 'stationary', 'limping', 'staff',
-        'banned', 'version', 'scroll', 'sensitivity', 'tooltips'
+    # 1. Direct question marks
+    if text.endswith('?'):
+        return True
+    
+    # 2. Question word starters (WH words, auxiliary verbs, modal verbs)
+    question_starters = [
+        # WH Questions
+        'who', 'what', 'when', 'where', 'why', 'how', 'which', 'whose', 'whom',
+        # Auxiliary verbs
+        'is', 'are', 'was', 'were', 'am', 'do', 'does', 'did', 'have', 'has', 'had',
+        'will', 'would', 'shall', 'should', 'can', 'could', 'may', 'might', 'must',
+        # Other question indicators
+        'anyone', 'anybody', 'someone', 'somebody'
     ]
     
-    # Check if query contains at least one domain keyword
-    has_domain_keyword = any(keyword in query_lower for keyword in domain_keywords)
-    if not has_domain_keyword:
-        return None
+    first_word = text.split()[0] if text.split() else ""
+    if first_word in question_starters:
+        return True
     
-    # Stopwords to filter out
-    stopwords = {'the', 'and', 'with', 'are', 'for', 'that', 'this', 'but', 'not', 'you', 'all', 'can', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'use', 'man', 'new', 'now', 'old', 'see', 'him', 'two', 'how', 'its', 'who', 'oil', 'sit', 'set'}
+    # 3. Help/support request patterns
+    help_patterns = [
+        'help', 'issue', 'problem', 'trouble', 'error', 'bug', 'broken', 'not working',
+        'doesnt work', "doesn't work", 'cant', "can't", 'unable', 'stuck', 'confused',
+        'support', 'assist', 'guide', 'tutorial', 'explain', 'clarify'
+    ]
     
-    best_match = None
-    best_score = 0
+    if any(pattern in text for pattern in help_patterns):
+        return True
     
-    for doc_key, doc_data in faq_docs.items():
-        content = doc_data['content'].lower()
-        # Score based on meaningful words, filtering stopwords
-        words = [w for w in query_lower.split() if len(w) > 2 and w not in stopwords]
-        score = sum(1 for word in words if word in content)
-        
-        if score >= 2 and score > best_score:  # Require at least 2 meaningful matches
-            best_score = score
-            # Extract relevant section (300 chars max)
+    # 4. Request patterns using regex
+    request_patterns = [
+        r'\b(please|pls)\b.*\b(help|show|tell|explain|guide)\b',
+        r'\bhow (to|do|can|should)\b',
+        r'\bwhat (is|are|does|do)\b',
+        r'\bwhere (is|are|can|do)\b',
+        r'\bwhy (is|are|does|do)\b',
+        r'\bwhen (is|are|does|do)\b',
+        r'\bwhich (is|are|does|do)\b',
+        r'\bwho (is|are|does|do)\b',
+        r'\b(can|could|would) (you|someone|anybody)\b',
+        r'\b(any|some)(one|body) know\b',
+        r'\bneed (help|assistance|support)\b',
+        r'\blooking for\b',
+        r'\btrying to\b.*\b(but|however|and)\b',
+        r'\bi (need|want|require)\b.*\b(help|info|information|guide)\b'
+    ]
+    
+    for pattern in request_patterns:
+        if re.search(pattern, text):
+            return True
+    
+    # 5. Imperative requests (commands that imply questions)
+    imperative_patterns = [
+        r'^(tell|show|explain|describe|list|give|provide)\s+me\b',
+        r'^(find|get|check|verify|confirm)\b',
+        r'^(teach|guide|walk)\s+me\b'
+    ]
+    
+    for pattern in imperative_patterns:
+        if re.search(pattern, text):
+            return True
+    
+    # 6. Uncertainty expressions that often indicate questions
+    uncertainty_patterns = [
+        'not sure', 'confused', 'dont understand', "don't understand", 'unclear',
+        'wondering', 'curious', 'question about', 'ask about', 'unsure'
+    ]
+    
+    if any(pattern in text for pattern in uncertainty_patterns):
+        return True
+    
+    # 7. Problem/issue indicators with contextual words
+    problem_contexts = [
+        'keeps', 'always', 'still', 'wont', "won't", 'fails', 'crashes',
+        'freezes', 'stops', 'slow', 'lag', 'glitch'
+    ]
+    
+    problem_words = ['error', 'issue', 'problem', 'trouble', 'bug']
+    
+    has_problem = any(word in text for word in problem_words)
+    has_context = any(context in text for context in problem_contexts)
+    
+    if has_problem and has_context:
+        return True
+    
+    # 8. Question-like sentence structures
+    question_structures = [
+        r'\bis there (a|an|any)\b',
+        r'\bdo (i|you|we|they)\b',
+        r'\bdoes (it|this|that|he|she)\b',
+        r'\bam i\b',
+        r'\bare (you|we|they)\b',
+        r'\bshould i\b',
+        r'\bwould (it|this|you)\b',
+        r'\bcould (it|this|you)\b'
+    ]
+    
+    for structure in question_structures:
+        if re.search(structure, text):
+            return True
+    
+    # 9. Conversational question indicators
+    conversation_patterns = [
+        'by any chance', 'happen to know', 'any idea', 'any thoughts',
+        'what do you think', 'in your opinion', 'suggestions', 'recommendations',
+        'advice', 'thoughts'
+    ]
+    
+    if any(pattern in text for pattern in conversation_patterns):
+        return True
+    
+    return False
+
+def is_admin_user(user_id):
+    """Check if user ID is in admin list"""
+    return user_id in ADMIN_USER_IDS
+
+def has_tellmeajoke_permission(member):
+    """Check if user can use tellmeajoke command"""
+    # Check if user is admin
+    if is_admin_user(member.id):
+        return True
+    
+    # Check if user has the required role
+    if hasattr(member, 'roles'):
+        for role in member.roles:
+            if role.id == TELLMEAJOKE_ROLE_ID:
+                return True
+    
+    return False
+
+def multi_source_search(query: str) -> str:
+    """Search multiple real-time sources for accurate information with enhanced current events coverage"""
+    results = []
+    query_lower = query.lower()
+    
+    # Enhanced current events detection
+    current_events_keywords = [
+        'news', 'today', 'recent', 'latest', 'current', 'happening', 'died', 'death', 'breaking',
+        'arrested', 'caught', 'situation', 'controversy', 'incident', 'scandal', 'trending',
+        'shot', 'killed', 'murder', 'crime', 'police', 'investigation', 'celebrity', 'famous'
+    ]
+    is_current_event = any(keyword in query_lower for keyword in current_events_keywords)
+    
+    # 1. PRIORITY: Enhanced news search for current events (if NewsAPI available)
+    if news_client and (is_current_event or len(query.split()) <= 3):
+        try:
+            search_strategies = [
+                {'q': query, 'sort_by': 'publishedAt'},
+                {'q': query, 'sort_by': 'relevancy'},
+            ]
+            
+            words = query.split()
+            if len(words) >= 2 and not any(common in query_lower for common in ['how', 'what', 'when', 'where', 'why']):
+                person_query = ' '.join(words[:2])
+                search_strategies.append({'q': f'"{person_query}" news', 'sort_by': 'publishedAt'})
+            
+            for strategy in search_strategies:
+                try:
+                    news_results = news_client.get_everything(
+                        language='en',
+                        page_size=3,
+                        from_param=(datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'),
+                        **strategy
+                    )
+                    
+                    if news_results['articles']:
+                        for article in news_results['articles'][:2]:
+                            published_date = article['publishedAt'][:10]
+                            source = article['source']['name']
+                            results.append(f"**📰 {article['title']}** ({source}, {published_date}): {article['description']}")
+                        break
+                except Exception as strategy_error:
+                    logger.error(f"News strategy error: {strategy_error}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Enhanced news search error: {e}")
+    
+    # 2. DuckDuckGo search (if available)
+    if DDGS:
+        try:
+            with DDGS() as ddgs:
+                search_queries = [query]
+                
+                if is_current_event:
+                    search_queries.extend([
+                        f"{query} 2024 2025",
+                        f"{query} news recent",
+                        f'"{query}" latest'
+                    ])
+                
+                for search_query in search_queries[:2]:
+                    try:
+                        web_results = list(ddgs.text(search_query, max_results=3))
+                        for r in web_results:
+                            if len(results) < 6:
+                                results.append(f"**🌐 {r['title']}**: {r['body']}")
+                        
+                        if len(results) >= 3:
+                            break
+                            
+                    except Exception as ddg_error:
+                        logger.error(f"DDG query '{search_query}' error: {ddg_error}")
+                        continue
+                        
+        except Exception as e:
+            logger.error(f"DuckDuckGo search error: {e}")
+    
+    # 3. Basic web scraping fallback using requests and BeautifulSoup
+    if len(results) < 2:
+        try:
+            # Simple web search using a search engine
+            search_url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(search_url, headers=headers, timeout=10)
+            if response.status_code == 200 and BeautifulSoup:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                # Extract search results (simplified)
+                search_divs = soup.find_all('div', class_='g')[:3]
+                for div in search_divs:
+                    title_elem = div.find('h3')
+                    snippet_elem = div.find('span')
+                    if title_elem and snippet_elem:
+                        title = title_elem.get_text()
+                        snippet = snippet_elem.get_text()
+                        if len(title) > 10 and len(snippet) > 20:  # Basic quality filter
+                            results.append(f"**🔍 {title}**: {snippet[:200]}...")
+                            
+        except Exception as e:
+            logger.error(f"Basic web search error: {e}")
+    
+    # 4. Stock search (if yfinance available)
+    if yf and not is_current_event and any(keyword in query_lower for keyword in ['stock', 'price', 'shares', 'market', '$', 'nasdaq', 'dow', 'sp500']):
+        try:
+            words = query.upper().split()
             for word in words:
-                if word in content:
-                    pos = content.find(word)
-                    start = max(0, pos - 100)
-                    end = min(len(content), pos + 200)
-                    excerpt = doc_data['content'][start:end].strip()
-                    if len(excerpt) > 300:
-                        excerpt = excerpt[:300] + "..."
-                    best_match = {
-                        'title': doc_data['title'],
-                        'excerpt': excerpt,
-                        'score': score
-                    }
-                    break
+                if len(word) <= 5 and word.isalpha():
+                    try:
+                        ticker = yf.Ticker(word)
+                        info = ticker.info
+                        current_price = info.get('currentPrice') or info.get('regularMarketPrice')
+                        if current_price:
+                            company_name = info.get('shortName', word)
+                            results.append(f"**💹 {company_name} ({word})**: ${current_price:.2f}")
+                            break
+                    except:
+                        continue
+        except Exception as e:
+            logger.error(f"Stock search error: {e}")
     
-    return best_match
-
-
-# -----------------------------
-# AI helper
-# -----------------------------
-async def check_doc_relevance(message):
-    """Check if message is related to documentation topics"""
-    if not client:
-        return False, None
+    # 5. Wikipedia search (if available)
+    if wikipedia and (not is_current_event or len(results) < 2):
+        try:
+            wiki_results = wikipedia.search(query, results=2)
+            if wiki_results:
+                page = wikipedia.page(wiki_results[0])
+                wiki_summary = wikipedia.summary(wiki_results[0], sentences=2)
+                results.append(f"**📖 {page.title}**: {wiki_summary}")
+                if len(results) < 5:
+                    results.append(f"🔗 {page.url}")
+        except Exception:
+            pass  # Simplified error handling for Wikipedia
     
+    return "\n\n".join(results) if results else "No reliable sources found for this query. Basic web search attempted but may have limited results due to missing search packages."
+
+def is_account_too_new(member):
+    """Check if account is less than 7 days old"""
+    account_age = datetime.utcnow() - member.created_at
+    return account_age.days < 7
+
+async def kick_new_account(member):
+    """Kick new accounts with appropriate message"""
     try:
-        # Build context from docs
-        docs_context = ""
-        if faq_docs:
-            for doc_key, doc_data in faq_docs.items():
-                docs_context += f"Document: {doc_data['title']}\n"
-                docs_context += f"Key topics: {doc_data['content'][:800]}...\n\n"
-        
-        prompt = f"""Analyze if this message is related to these documentation topics:
-
-{docs_context}
-
-Message: "{message}"
-
-Respond with:
-- "YES" if related to roblox, fisch, macro, autohotkey, helper guidelines, camera settings, or similar topics from the docs
-- "NO" if unrelated (greetings, random chat, off-topic)
-
-If YES, provide a helpful answer based ONLY on the documentation content.
-
-Format: YES/NO|Answer (if YES)"""
-        
-        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-        if response.text:
-            parts = response.text.strip().split('|', 1)
-            is_relevant = parts[0].strip().upper() == 'YES'
-            answer = parts[1].strip() if len(parts) > 1 and is_relevant else None
-            return is_relevant, answer
-        return False, None
+        days_remaining = 7 - (datetime.utcnow() - member.created_at).days
+        await member.send(f"Please come back in {days_remaining} days. Only accounts 7+ days old can join this server.")
+        await member.kick(reason="Account too new (< 7 days)")
+        logger.info(f"Kicked {member.name} - account too new")
     except Exception as e:
-        logger.error(f"Relevance check error: {e}")
-        return False, None
+        logger.error(f"Failed to kick {member.name}: {e}")
 
-def get_specific_responses(message):
-    """Handle specific common questions"""
-    text = message.lower()
+# -----------------------------
+# Knowledge Base Responses
+# -----------------------------
+def get_knowledge_response(message_content):
+    """Get response based on new knowledge base"""
+    text = message_content.lower()
+
+    # Grox response - works in any sentence
+    if 'grox' in text:
+        grox_responses = [
+            "Kill grox",
+            "Nobody asked grox",
+            "Grox needs to disappear",
+            "Imagine being grox 💀",
+            "Grox = L + ratio + touch grass"
+        ]
+        return random.choice(grox_responses)
+
+    # Andrew joke response - only for "who is andrew"
+    if 'who is andrew' in text:
+        if client:
+            try:
+                joke_categories = [
+                    "career failures and professional incompetence",
+                    "social awkwardness and failed relationships",
+                    "terrible life choices and poor decision making",
+                    "unsuccessful hobbies and boring personality",
+                    "lack of intelligence and common sense",
+                    "physical appearance and fashion disasters"
+                ]
+
+                selected_category = random.choice(joke_categories)
+                joke_prompt = f"""Create a harsh but funny two-line roast about Andrew focusing on {selected_category}. Make it brutal but playful. Include an emoji at the end. Be creative and unique."""
+
+                response = client.generate_content(joke_prompt)
+                if response.text:
+                    return response.text.strip()
+            except Exception as e:
+                logger.error(f"Andrew joke generation error: {e}")
+
+        return "Andrew? Just some random person nobody cares about! 🤷"
+
+    # Rushi response - AI generated
+    if 'who is rushi' in text:
+        if client:
+            try:
+                rushi_prompt = """Create a cool, positive response about Rushi being a developer. Make it enthusiastic and mention that she's a cool individual, developer, and nerdy in a positive way. Keep it to 1-2 sentences and include an emoji. Make it sound genuine and awesome."""
+                
+                response = client.generate_content(rushi_prompt)
+                if response.text:
+                    return response.text.strip()
+            except Exception as e:
+                logger.error(f"Rushi response generation error: {e}")
+        
+        return "Rushi is an amazing developer, a super cool individual and proudly nerdy! 🤓✨"
+
+    # Werzzzy response
+    if 'who is werzzzy' in text:
+        werzzzy_responses = [
+            "Werzzzy is an absolute legend and coding genius! 🔥",
+            "Werzzzy? That's the coolest developer in the game! 💯",
+            "Werzzzy is basically a programming wizard ✨",
+            "The one and only Werzzzy - pure awesomeness! 🚀"
+        ]
+        return random.choice(werzzzy_responses)
+
+    # How to read response
+    if 'how to read' in text:
+        read_jokes = [
+            "Here's your reading tutorial: https://www.wikihow.com/Teach-Yourself-to-Read\n\n*Imagine not being able to read in 2025... peak Discord behavior* 📚",
+            "Reading lessons: https://www.wikihow.com/Teach-Yourself-to-Read\n\n*This is why aliens don't visit us anymore* 🛸📚",
+            "Your literacy salvation: https://www.wikihow.com/Teach-Yourself-to-Read\n\n*POV: You're asking Discord how to read instead of just... reading* 🤦📚"
+        ]
+        return random.choice(read_jokes)
+
+    # Specific macro location requests - more precise matching
+    macro_patterns = [
+        'where can i find the fisch macro',
+        'where fisch macro',
+        'where macro',
+        'where fisch',
+        'fisch macro location',
+        'macro location'
+    ]
     
-    # Fisch macro location
-    if any(term in text for term in ['fisch', 'fish']) and any(term in text for term in ['macro', 'where', 'location']):
-        return "https://discord.com/channels/1341949236471926804/1413837110770925578 - You can find the fisch macro in this channel."
+    if any(pattern in text for pattern in macro_patterns):
+        return "**Fisch Macro:** https://discord.com/channels/1341949236471926804/1413837110770925578/1417999310443905116"
+
+    # Specific config location requests - more precise matching
+    config_patterns = [
+        'where can i find the config',
+        'where can i find the fisch config',
+        'where fisch config',
+        'where config',
+        'fisch config location',
+        'config location'
+    ]
     
-    # AHK version question
-    if any(term in text for term in ['ahk', 'autohotkey']) and any(term in text for term in ['version', 'what']):
-        return "Use AutoHotkey v1.1 for the fisch macro."
-    
-    # Macro not working
-    if any(term in text for term in ['not working', 'broken', 'doesnt work', "doesn't work", 'help']) and 'macro' in text:
-        return """To fix macro issues:
-1. Download AutoHotkey v1.1 from https://autohotkey.com
-2. Use Web Roblox (not Microsoft Store version)
-3. Check your Navigation Key settings
-4. Ensure Auto Lower Graphics is enabled
-5. Make sure you have the correct delays configured
-6. Verify your camera zoom and shake settings are properly set up"""
-    
+    if any(pattern in text for pattern in config_patterns):
+        return "**Fisch Configs:** https://discord.com/channels/1341949236471926804/1411335491457913014"
+
+    # Mango/Fisch macro location
+    if 'mango' in text and ('you know' in text or 'where' in text or 'find' in text):
+        return "Fisch macro: https://discord.com/channels/1341949236471926804/1413837110770925578/1417999310443905116"
+
+    # General Issues Keywords
+    if any(keyword in text for keyword in ['ahk', 'autohotkey', 'auto hotkey']):
+        return "**AutoHotkey Version:** Use AHK v1.1 (NOT v2) - v2 is not supported for the current fisch macro."
+
+    if any(keyword in text for keyword in ['roblox version', 'wrong roblox', 'microsoft roblox']):
+        return "**Wrong Roblox Version:** Use Web Roblox (Chrome/Brave/etc), NOT Microsoft Store version. Microsoft Roblox will break the macro completely."
+
+    if any(keyword in text for keyword in ['bannable', 'banned', 'ban']) and 'macro' in text:
+        return "**Is the macro bannable?** NO - The macro is like an advanced autoclicker. It doesn't inject anything into the game, making it safe and saves you time on games you love."
+
+    if any(keyword in text for keyword in ['roblox settings', 'settings']):
+        return "**Roblox Settings:** Fullscreen OFF, graphics 1, dark avatar, brightness/saturation OFF, disable camera shake."
+
+    if any(keyword in text for keyword in ['install', 'installation']):
+        return "**Installation Issues:** If AHK fails, uninstall & reinstall. Check antivirus/browser blocking IRUS."
+
+    if any(keyword in text for keyword in ['moved forward', 'moving forward', 'move forward']):
+        return "**Being Moved Forward:** Cause = click-to-move enabled or failed catch. Fix = disable click-to-move, use better rods+bait+configs to reduce fails."
+
+    # Debugging Flow
+    if any(keyword in text for keyword in ['shake not working', 'shake issue', 'debug shake']):
+        return "**Shake Not Working:** If mouse not moving → wrong Roblox version (use Web Roblox, not Microsoft)."
+
     return None
 
 # -----------------------------
@@ -249,100 +563,206 @@ async def on_ready():
         logger.error(f"❌ Sync failed: {e}")
 
 @bot.event
+async def on_member_join(member):
+    """Auto-kick accounts less than 7 days old"""
+    if is_account_too_new(member):
+        await kick_new_account(member)
+
+@bot.event
+async def on_member_update(before, after):
+    """Enforce persistent nicknames"""
+    if str(after.id) in persistent_names:
+        enforced_nick = persistent_names[str(after.id)]
+        if after.display_name != enforced_nick:
+            try:
+                await after.edit(nick=enforced_nick, reason="Name persistence enforced")
+                logger.info(f"Reset {after.name}'s nickname to {enforced_nick}")
+            except Exception as e:
+                logger.error(f"Failed to reset nickname for {after.name}: {e}")
+
+@bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
 
-    # Use AI to check if message is related to docs FIRST
-    is_relevant, ai_answer = await check_doc_relevance(message.content)
-    if not is_relevant:
-        # If not doc-related, stay completely silent
-        await bot.process_commands(message)
-        return
-
-    # If relevant, check specific hardcoded responses first
-    specific_response = get_specific_responses(message.content)
-    if specific_response:
-        await message.reply(specific_response)
-        learning_data.add_conversation(message.author.id, message.content, specific_response)
-        return
-
-    # Then check FAQ documents
-    faq_result = search_faq_docs(message.content)
-    if faq_result:
-        response = f"**{faq_result['title']}:**\\n{faq_result['excerpt']}"
-        await message.reply(response)
-        learning_data.add_conversation(message.author.id, message.content, response)
-        return
-
-    # Finally use AI answer if available
-    if ai_answer:
-        await message.reply(ai_answer)
-        learning_data.add_conversation(message.author.id, message.content, ai_answer)
+    # Respond to DMs or mentions
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    is_mentioned = bot.user in message.mentions
+    
+    # Special responses that don't need question indicators
+    special_triggers = ['grox', 'who is andrew', 'who is rushi', 'who is werzzzy', 'how to read']
+    
+    # Check for special triggers or use advanced question detection
+    has_special_trigger = any(trigger in message.content.lower() for trigger in special_triggers)
+    is_question = is_advanced_question(message.content)
+    
+    # Respond if it's a DM, mention, has special trigger, or is a question
+    if is_dm or is_mentioned or has_special_trigger or is_question:
+        response = get_knowledge_response(message.content)
+        if response:
+            await message.reply(response)
+        elif is_dm or is_mentioned:
+            # If no specific response but it's a DM/mention, give a general response
+            await message.reply("Hey! I'm here to help with Fisch macros or you can use `/askbloom` to ask me anything!")
 
     await bot.process_commands(message)
 
 # -----------------------------
-# Slash Commands
+# Commands
 # -----------------------------
-
-@bot.tree.command(name="learn", description="Teach Bloom something new")
-@app_commands.describe(
-    url="Optional source link (e.g., Google Doc or website)",
-    title="Title of the knowledge",
-    content="Optional extra content (if no URL, you must provide content)"
-)
-async def learn_command(interaction: discord.Interaction, url: str = "", title: str = "Untitled", content: str = ""):
-    text_content = content
-
-    # If URL provided, try fetching text
-    if url:
-        try:
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
-                downloaded = trafilatura.extract(resp.text)
-                if downloaded:
-                    text_content += "\n" + downloaded
-                else:
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                    text_content += "\n" + soup.get_text(separator="\n")
-        except Exception as e:
-            await interaction.response.send_message(f"⚠️ Failed to fetch from URL: {e}", ephemeral=True)
-            return
-
-    if not text_content.strip():
-        await interaction.response.send_message("❌ You must provide content or a valid URL.", ephemeral=True)
+@bot.tree.command(name="askbloom", description="Ask Bloom anything with web search for accurate info")
+@app_commands.describe(question="Your question - I'll search the web for current information!")
+async def askbloom_command(interaction: discord.Interaction, question: str):
+    if not client:
+        await interaction.response.send_message("❌ AI service not available.", ephemeral=True)
         return
 
-    learning_data.add_learned_content(url, title, text_content.strip(), interaction.user.id)
-    await interaction.response.send_message(f"✅ Learned new content titled **{title}**", ephemeral=True)
+    # Content filter
+    question_lower = question.lower()
+    banned_words = ['racist', 'racism', 'nazi', 'hitler', 'slur', 'hate speech', 'nigger', 'faggot']
 
-@bot.tree.command(name="ask", description="Ask a question about macros or helpers")
-@app_commands.describe(question="Your question about macros, settings, or helper guidelines")
-async def ask_command(interaction: discord.Interaction, question: str):
-    # Check specific responses first
-    specific_response = get_specific_responses(question)
-    if specific_response:
-        await interaction.response.send_message(specific_response)
-        learning_data.add_conversation(interaction.user.id, question, specific_response)
+    if any(word in question_lower for word in banned_words):
+        await interaction.response.send_message("❌ I can't help with that. Ask something else!", ephemeral=True)
         return
+
+    # Send initial response and defer for longer processing
+    await interaction.response.defer()
+
+    try:
+        # First check if it's a Fisch macro related question
+        knowledge_response = get_knowledge_response(question)
+        
+        if knowledge_response:
+            # Use existing knowledge base for Fisch-related questions
+            await interaction.followup.send(knowledge_response)
+        else:
+            # Search multiple sources for general questions
+            search_results = multi_source_search(question)
+            
+            prompt = f"""You are Bloom, a Discord bot assistant. Analyze the search results and provide a direct, accurate answer.
+
+CRITICAL ANALYSIS REQUIRED:
+- Question assumptions in the query if data contradicts them
+- Identify potential biases in sources
+- Offer counterpoints when evidence supports them
+- Don't sugarcoat - be direct about facts even if uncomfortable
+- Challenge popular misconceptions with evidence
+
+SEARCH RESULTS:
+{search_results}
+
+USER QUESTION: {question}
+
+Provide a substantive, evidence-based response under 1800 characters. Focus on accuracy over politeness. If sources conflict, explain why. If the question contains false assumptions, correct them directly."""
+
+            response = client.generate_content(prompt)
+            if response.text:
+                answer = response.text.strip()
+                if len(answer) > 1800:
+                    answer = answer[:1797] + "..."
+                await interaction.followup.send(answer)
+            else:
+                await interaction.followup.send("❌ Couldn't generate response. Try again!")
+
+    except Exception as e:
+        logger.error(f"AskBloom error: {e}")
+        await interaction.followup.send("❌ Something went wrong while searching. Try again!")
+
+@bot.tree.command(name="ban", description="Ban a user (Admin only)")
+@app_commands.describe(user="User to ban")
+async def ban_command(interaction: discord.Interaction, user: discord.Member):
+    if not is_admin_user(interaction.user.id):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+
+    try:
+        await user.ban(reason=f"Banned by {interaction.user.name}")
+        await interaction.response.send_message(f"✅ Banned {user.mention}")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to ban user: {e}", ephemeral=True)
+
+@bot.tree.command(name="namepersist", description="Force a user to keep a specific nickname (Admin only)")
+@app_commands.describe(user="User to enforce nickname on", nickname="Nickname to enforce")
+async def namepersist_command(interaction: discord.Interaction, user: discord.Member, nickname: str):
+    if not is_admin_user(interaction.user.id):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+
+    try:
+        await user.edit(nick=nickname, reason=f"Name persistence set by {interaction.user.name}")
+        persistent_names[str(user.id)] = nickname
+        save_persistent_data()
+        await interaction.response.send_message(f"✅ {user.mention} will now always have the nickname: **{nickname}**")
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Failed to set persistent nickname: {e}", ephemeral=True)
+
+@bot.tree.command(name="say", description="Make Bloom say something (Admin only)")
+@app_commands.describe(words="What should Bloom say?")
+async def say_command(interaction: discord.Interaction, words: str):
+    if not is_admin_user(interaction.user.id):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+        
+    if len(words) > 2000:
+        await interaction.response.send_message("❌ Message too long! Keep it under 2000 characters.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(words)
+
+@bot.tree.command(name="tellmeajoke", description="Get a custom AI-generated joke")
+@app_commands.describe(context="Context for the joke (e.g., 'say something bad about my name')")
+async def tellmeajoke_command(interaction: discord.Interaction, context: str):
+    # Check permissions
+    if not has_tellmeajoke_permission(interaction.user):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+
+    if not client:
+        await interaction.response.send_message("❌ AI service not available.", ephemeral=True)
+        return
+
+    # Content filter
+    context_lower = context.lower()
+    banned_words = ['racist', 'racism', 'nazi', 'hitler', 'slur', 'hate speech', 'nigger', 'faggot']
+
+    if any(word in context_lower for word in banned_words):
+        await interaction.response.send_message("❌ I can't make jokes about that. Try something else!", ephemeral=True)
+        return
+
+    try:
+        prompt = f"""You are Bloom, a Discord bot with a sharp sense of humor. Create a funny, clever joke based on this context: "{context}"
+
+Make it witty and humorous but not offensive or mean-spirited. Keep it under 500 characters and add an appropriate emoji at the end. Be creative and entertaining!"""
+
+        response = client.generate_content(prompt)
+        if response.text:
+            joke = response.text.strip()
+            if len(joke) > 500:
+                joke = joke[:497] + "..."
+            await interaction.response.send_message(joke)
+        else:
+            await interaction.response.send_message("❌ Couldn't generate a joke. Try again!", ephemeral=True)
+
+    except Exception as e:
+        logger.error(f"Tellmeajoke error: {e}")
+        await interaction.response.send_message("❌ Something went wrong. Try again!", ephemeral=True)
+
+@bot.tree.command(name="whatisthisserverabout", description="Learn about this Discord server")
+async def whatisthisserverabout_command(interaction: discord.Interaction):
+    server_responses = [
+        "🥭 **This server is all about mangoes and tiny tasks!** We're building something amazing here - this server will soon be a big Discord server as we have big plans! Join us on this exciting journey! 🚀",
+        
+        "🍃 **Welcome to the mango paradise!** This community focuses on mangoes and small but important tasks. We're growing fast and have huge plans ahead - you're part of something special! 🌟",
+        
+        "🥭 **Mango lovers unite!** This server revolves around mangoes and managing tiny tasks efficiently. We're just getting started but we have BIG dreams for this community! 💫",
+        
+        "🌱 **The mango hub is here!** We're all about those sweet mangoes and tackling small tasks together. This server is destined for greatness - stick around for the journey! 🎯",
+        
+        "🥭 **Mangoes + Tiny Tasks = Magic!** That's what this server is about! We're small now but we have massive plans brewing. Welcome to what will soon be an epic Discord community! ⚡"
+    ]
     
-    # Check FAQ documents
-    faq_result = search_faq_docs(question)
-    if faq_result:
-        response = f"**{faq_result['title']}:**\n{faq_result['excerpt']}"
-        await interaction.response.send_message(response)
-        learning_data.add_conversation(interaction.user.id, question, response)
-        return
-    
-    # Use AI to check relevance and generate answer
-    is_relevant, ai_answer = await check_doc_relevance(question)
-    if is_relevant and ai_answer:
-        await interaction.response.send_message(ai_answer)
-        learning_data.add_conversation(interaction.user.id, question, ai_answer)
-    else:
-        await interaction.response.send_message("Question not related to available documentation.", ephemeral=True)
-
+    random_response = random.choice(server_responses)
+    await interaction.response.send_message(random_response)
 
 # -----------------------------
 # Run bot
