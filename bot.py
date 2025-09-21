@@ -89,7 +89,7 @@ client = None
 if gemini_key:
     try:
         genai.configure(api_key=gemini_key)
-        client = genai.GenerativeModel('gemini-1.5-flash')
+        client = genai.GenerativeModel('gemini-2.0-flash')
         logger.info("✅ Gemini client initialized")
     except Exception as e:
         logger.error(f"❌ Gemini init failed: {e}")
