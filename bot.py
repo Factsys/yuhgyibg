@@ -445,13 +445,13 @@ def multi_source_search(query: str) -> str:
 
 def is_account_too_new(member):
     """Check if account is less than 7 days old"""
-    account_age = datetime.utcnow() - member.created_at
+    account_age = datetime.now(member.created_at.tzinfo) - member.created_at
     return account_age.days < 7
 
 async def kick_new_account(member):
     """Kick new accounts with appropriate message"""
     try:
-        days_remaining = 7 - (datetime.utcnow() - member.created_at).days
+        days_remaining = 7 - (datetime.now(member.created_at.tzinfo) - member.created_at).days
         await member.send(f"Please come back in {days_remaining} days. Only accounts 7+ days old can join this server.")
         await member.kick(reason="Account too new (< 7 days)")
         logger.info(f"Kicked {member.name} - account too new")
