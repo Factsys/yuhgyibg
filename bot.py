@@ -294,6 +294,14 @@ def multi_source_search(query: str) -> str:
             
             for strategy in search_strategies:
                 try:
+                    # Add timeout to news API calls
+                    import signal
+                    def timeout_handler(signum, frame):
+                        raise TimeoutError("News API timeout")
+                    
+                    signal.signal(signal.SIGALRM, timeout_handler)
+                    signal.alarm(5)  # 5 second timeout
+                    
                     news_results = news_client.get_everything(
                         language='en',
                         page_size=3,
@@ -301,38 +309,47 @@ def multi_source_search(query: str) -> str:
                         **strategy
                     )
                     
+                    signal.alarm(0)  # Cancel timeout
+                    
                     if news_results['articles']:
                         for article in news_results['articles'][:2]:
                             published_date = article['publishedAt'][:10]
                             source = article['source']['name']
                             results.append(f"**📰 {article['title']}** ({source}, {published_date}): {article['description']}")
                         break
-                except Exception as strategy_error:
+                except (TimeoutError, Exception) as strategy_error:
+                    signal.alarm(0)  # Cancel timeout
                     logger.error(f"News strategy error: {strategy_error}")
                     continue
                     
         except Exception as e:
             logger.error(f"Enhanced news search error: {e}")
     
-    # 2. DuckDuckGo search (if available)
-    if DDGS:
+    # 2. DuckDuckGo search (if available) - with timeout
+    if DDGS and len(results) < 3:
         try:
+            import signal
+            def timeout_handler(signum, frame):
+                raise TimeoutError("DuckDuckGo timeout")
+            
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(8)  # 8 second timeout for DDG
+            
             with DDGS() as ddgs:
                 search_queries = [query]
                 
                 if is_current_event:
                     search_queries.extend([
                         f"{query} 2024 2025",
-                        f"{query} news recent",
-                        f'"{query}" latest'
+                        f"{query} news recent"
                     ])
                 
                 for search_query in search_queries[:2]:
                     try:
-                        web_results = list(ddgs.text(search_query, max_results=3))
+                        web_results = list(ddgs.text(search_query, max_results=2))
                         for r in web_results:
-                            if len(results) < 6:
-                                results.append(f"**🌐 {r['title']}**: {r['body']}")
+                            if len(results) < 4:
+                                results.append(f"**🌐 {r['title']}**: {r['body'][:150]}...")
                         
                         if len(results) >= 3:
                             break
@@ -340,37 +357,38 @@ def multi_source_search(query: str) -> str:
                     except Exception as ddg_error:
                         logger.error(f"DDG query '{search_query}' error: {ddg_error}")
                         continue
+            
+            signal.alarm(0)  # Cancel timeout
                         
-        except Exception as e:
+        except (TimeoutError, Exception) as e:
+            signal.alarm(0)  # Cancel timeout
             logger.error(f"DuckDuckGo search error: {e}")
     
-    # 3. Basic web scraping fallback using requests and BeautifulSoup
+    # 3. Basic web scraping fallback - with timeout
     if len(results) < 2:
         try:
-            # Simple web search using a search engine
             search_url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
             
-            response = requests.get(search_url, headers=headers, timeout=10)
+            response = requests.get(search_url, headers=headers, timeout=5)
             if response.status_code == 200 and BeautifulSoup:
                 soup = BeautifulSoup(response.content, 'html.parser')
-                # Extract search results (simplified)
-                search_divs = soup.find_all('div', class_='g')[:3]
+                search_divs = soup.find_all('div', class_='g')[:2]
                 for div in search_divs:
                     title_elem = div.find('h3')
                     snippet_elem = div.find('span')
                     if title_elem and snippet_elem:
                         title = title_elem.get_text()
                         snippet = snippet_elem.get_text()
-                        if len(title) > 10 and len(snippet) > 20:  # Basic quality filter
-                            results.append(f"**🔍 {title}**: {snippet[:200]}...")
+                        if len(title) > 10 and len(snippet) > 20:
+                            results.append(f"**🔍 {title}**: {snippet[:150]}...")
                             
         except Exception as e:
             logger.error(f"Basic web search error: {e}")
     
-    # 4. Stock search (if yfinance available)
+    # 4. Stock search (if yfinance available) - with timeout
     if yf and not is_current_event and any(keyword in query_lower for keyword in ['stock', 'price', 'shares', 'market', '$', 'nasdaq', 'dow', 'sp500']):
         try:
             words = query.upper().split()
@@ -378,31 +396,52 @@ def multi_source_search(query: str) -> str:
                 if len(word) <= 5 and word.isalpha():
                     try:
                         ticker = yf.Ticker(word)
+                        # Set timeout for yfinance
+                        import signal
+                        def timeout_handler(signum, frame):
+                            raise TimeoutError("YFinance timeout")
+                        
+                        signal.signal(signal.SIGALRM, timeout_handler)
+                        signal.alarm(3)  # 3 second timeout
+                        
                         info = ticker.info
                         current_price = info.get('currentPrice') or info.get('regularMarketPrice')
+                        
+                        signal.alarm(0)  # Cancel timeout
+                        
                         if current_price:
                             company_name = info.get('shortName', word)
                             results.append(f"**💹 {company_name} ({word})**: ${current_price:.2f}")
                             break
-                    except:
+                    except (TimeoutError, Exception):
+                        signal.alarm(0)  # Cancel timeout
                         continue
         except Exception as e:
             logger.error(f"Stock search error: {e}")
     
-    # 5. Wikipedia search (if available)
+    # 5. Wikipedia search (if available) - with timeout
     if wikipedia and (not is_current_event or len(results) < 2):
         try:
-            wiki_results = wikipedia.search(query, results=2)
+            import signal
+            def timeout_handler(signum, frame):
+                raise TimeoutError("Wikipedia timeout")
+            
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(4)  # 4 second timeout
+            
+            wiki_results = wikipedia.search(query, results=1)
             if wiki_results:
                 page = wikipedia.page(wiki_results[0])
                 wiki_summary = wikipedia.summary(wiki_results[0], sentences=2)
                 results.append(f"**📖 {page.title}**: {wiki_summary}")
-                if len(results) < 5:
-                    results.append(f"🔗 {page.url}")
-        except Exception:
-            pass  # Simplified error handling for Wikipedia
+            
+            signal.alarm(0)  # Cancel timeout
+            
+        except (TimeoutError, Exception):
+            signal.alarm(0)  # Cancel timeout
+            pass
     
-    return "\n\n".join(results) if results else "No reliable sources found for this query. Basic web search attempted but may have limited results due to missing search packages."
+    return "\n\n".join(results) if results else "I couldn't find reliable information for this query right now. Please try rephrasing your question or try again later."
 
 def is_account_too_new(member):
     """Check if account is less than 7 days old"""
@@ -636,10 +675,28 @@ async def askbloom_command(interaction: discord.Interaction, question: str):
             # Use existing knowledge base for Fisch-related questions
             await interaction.followup.send(knowledge_response)
         else:
-            # Search multiple sources for general questions
-            search_results = multi_source_search(question)
-            
-            prompt = f"""You are Bloom, a Discord bot assistant. Analyze the search results and provide a direct, accurate answer.
+            # Add timeout wrapper for the entire search process
+            async def search_with_timeout():
+                try:
+                    # Run search in a separate thread to avoid blocking
+                    import concurrent.futures
+                    import threading
+                    
+                    def run_search():
+                        return multi_source_search(question)
+                    
+                    # Use ThreadPoolExecutor with timeout
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(run_search)
+                        try:
+                            search_results = future.result(timeout=15)  # 15 second total timeout
+                        except concurrent.futures.TimeoutError:
+                            return "Search timed out. Please try a simpler question or try again later."
+                    
+                    if not search_results or search_results.strip() == "":
+                        return "No information found. Please try rephrasing your question."
+                    
+                    prompt = f"""You are Bloom, a Discord bot assistant. Analyze the search results and provide a direct, accurate answer.
 
 CRITICAL ANALYSIS REQUIRED:
 - Question assumptions in the query if data contradicts them
@@ -655,18 +712,34 @@ USER QUESTION: {question}
 
 Provide a substantive, evidence-based response under 1800 characters. Focus on accuracy over politeness. If sources conflict, explain why. If the question contains false assumptions, correct them directly."""
 
-            response = client.generate_content(prompt)
-            if response.text:
-                answer = response.text.strip()
-                if len(answer) > 1800:
-                    answer = answer[:1797] + "..."
-                await interaction.followup.send(answer)
-            else:
-                await interaction.followup.send("❌ Couldn't generate response. Try again!")
+                    # Add timeout for AI generation
+                    try:
+                        response = client.generate_content(prompt)
+                        if response.text:
+                            answer = response.text.strip()
+                            if len(answer) > 1800:
+                                answer = answer[:1797] + "..."
+                            return answer
+                        else:
+                            return "❌ Couldn't generate response. Try again!"
+                    except Exception as ai_error:
+                        logger.error(f"AI generation error: {ai_error}")
+                        return "❌ AI service temporarily unavailable. Try again!"
+                        
+                except Exception as search_error:
+                    logger.error(f"Search error: {search_error}")
+                    return "❌ Search failed. Try a simpler question or try again later."
+            
+            # Run the search with timeout
+            result = await search_with_timeout()
+            await interaction.followup.send(result)
 
+    except asyncio.TimeoutError:
+        logger.error("AskBloom timeout")
+        await interaction.followup.send("❌ Request timed out. Try a simpler question!")
     except Exception as e:
         logger.error(f"AskBloom error: {e}")
-        await interaction.followup.send("❌ Something went wrong while searching. Try again!")
+        await interaction.followup.send("❌ Something went wrong. Try again!")
 
 @bot.tree.command(name="ban", description="Ban a user (Admin only)")
 @app_commands.describe(user="User to ban")
