@@ -633,24 +633,14 @@ def get_knowledge_response(message_content):
 
         if client:
             try:
-                joke_categories = [
-                    "career failures and professional incompetence",
-                    "social awkwardness and failed relationships",
-                    "terrible life choices and poor decision making",
-                    "unsuccessful hobbies and boring personality",
-                    "lack of intelligence and common sense",
-                    "physical appearance and fashion disasters"
-                ]
+                joke_prompt = """Create ONE brutal, concise roast about Andrew. Make it savage and cutting like these examples:
+"Andrew's the reason shampoo has instructions."
+"Andrew brings everyone joy—when he leaves the room."
+"If stupidity was a sport, Andrew would be a professional."
+"Andrew's like a cloud—when he's gone, it's a beautiful day."
+"Andrew's the human equivalent of a participation trophy."
 
-                selected_category = random.choice(joke_categories)
-                joke_prompt = """Create a brutal 2-3 sentence roast about Andrew. Make it savage and cutting like these examples:
-"I'd agree with you, but then we'd both be wrong. You're the reason the gene pool needs a lifeguard."
-"I've seen smarter cabinets at IKEA. You bring everyone joy—when you leave the room."
-"Evolution saw you and pressed undo. You're like a cloud—when you're gone, it's a beautiful day."
-"You're the human equivalent of a typo. If clueless paid, you'd retire twice."
-"You're Monday in human form. As useful as a knitted condom."
-
-Create 2-3 harsh, clever sentences about Andrew. Keep it brutal but concise. No emoji."""
+Create ONE short, Super harsh sentence about Andrew. Keep it brutal but concise and no unnecesarry additions. No emoji."""
 
                 response = client.generate_content(joke_prompt)
                 if response.text:
@@ -978,9 +968,17 @@ async def ban_command(interaction: discord.Interaction, user: discord.User, reas
         return
 
     try:
-        # Check if user is already banned
-        banned_users = [ban_entry async for ban_entry in interaction.guild.bans()]
-        is_banned = any(ban_entry.user.id == user.id for ban_entry in banned_users)
+        # More robust ban status checking
+        is_banned = False
+        try:
+            await interaction.guild.fetch_ban(user)
+            is_banned = True
+        except discord.NotFound:
+            is_banned = False
+        except Exception:
+            # Fallback to the original method if fetch_ban fails
+            banned_users = [ban_entry async for ban_entry in interaction.guild.bans()]
+            is_banned = any(ban_entry.user.id == user.id for ban_entry in banned_users)
         
         action_reason = reason or f"Action by {interaction.user.name}"
         
