@@ -636,7 +636,19 @@ def get_knowledge_response(message_content):
                 ]
 
                 selected_category = random.choice(joke_categories)
-                joke_prompt = f"""Create a savage, ruthless roast about Andrew focusing on {selected_category}. Make it brutal, creative and unique - absolutely demolish him with clever insults. Include an emoji at the end."""
+                joke_prompt = """Create a brutal one-liner roast about Andrew. Make it savage and cutting like these examples:
+"I'd agree with you, but then we'd both be wrong."
+"You're the reason the gene pool needs a lifeguard."
+"I've seen smarter cabinets at IKEA."
+"You bring everyone joy—when you leave the room."
+"Evolution saw you and pressed undo."
+"You're like a cloud—when you're gone, it's a beautiful day."
+"You're the human equivalent of a typo."
+"If clueless paid, you'd retire twice."
+"You're Monday in human form."
+"As useful as a knitted condom."
+
+Create ONE harsh, clever one-liner about Andrew. No emoji."""
 
                 response = client.generate_content(joke_prompt)
                 if response.text:
@@ -889,7 +901,6 @@ async def askbloom_command(interaction: discord.Interaction, question: str):
                 try:
                     # Run search in a separate thread to avoid blocking
                     import concurrent.futures
-                    import threading
 
                     def run_search():
                         return multi_source_search(question)
@@ -1148,14 +1159,16 @@ async def listofkeywords_command(interaction: discord.Interaction):
         return
 
     if not keywords_data:
-        await interaction.response.send_message("()", ephemeral=True)
+        embed = discord.Embed(title="📝 Keywords List", description="()", color=0x3498db)
+        await interaction.response.send_message(embed=embed)
         return
     
     # Format as requested: (name,name,name,name,name,name,name) with no spaces
     keyword_names = list(keywords_data.keys())
     formatted_list = "(" + ",".join(keyword_names) + ")"
     
-    await interaction.response.send_message(formatted_list, ephemeral=True)
+    embed = discord.Embed(title="📝 Keywords List", description=formatted_list, color=0x3498db)
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="deletekeywords", description="Delete a keyword by name (Admin only)")
 @app_commands.describe(name_of_keyword="Name of the keyword to delete")
