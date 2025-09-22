@@ -633,14 +633,14 @@ def get_knowledge_response(message_content):
 
         if client:
             try:
-                joke_prompt = """Create ONE brutal, concise roast about Andrew. Make it savage and cutting like these examples:
-"Andrew's the reason shampoo has instructions."
-"Andrew brings everyone joy—when he leaves the room."
-"If stupidity was a sport, Andrew would be a professional."
-"Andrew's like a cloud—when he's gone, it's a beautiful day."
-"Andrew's the human equivalent of a participation trophy."
+                joke_prompt = """Create a harsh, creative response about Andrew starting with "Oh Andrew, that guy..." or similar harsh introductory phrases. Make it brutal and cutting but creative. Examples of the style:
 
-Create ONE short, Super harsh sentence about Andrew. Keep it brutal but concise and no unnecesarry additions. No emoji."""
+"Oh Andrew, that guy who peaked in kindergarten..."
+"Andrew? That walking disappointment who..."
+"Oh you mean Andrew, the human equivalent of..."
+"Andrew... that guy who makes everyone appreciate silence..."
+
+Create ONE response starting with a harsh introductory phrase about Andrew. Make it savage but creative. No emoji."""
 
                 response = client.generate_content(joke_prompt)
                 if response.text:
@@ -648,7 +648,7 @@ Create ONE short, Super harsh sentence about Andrew. Keep it brutal but concise 
             except Exception as e:
                 logger.error(f"Andrew joke generation error: {e}")
 
-        return "Andrew? Just some random person nobody cares about! 🤷"
+        return "Oh Andrew, that guy nobody really cares about! 🤷"
 
     # Check deterministic FAQ after special cases
     faq_answer = find_faq_answer(message_content)
@@ -659,7 +659,7 @@ Create ONE short, Super harsh sentence about Andrew. Keep it brutal but concise 
     if 'who is rushi' in text:
         if client:
             try:
-                rushi_prompt = """Create a cool, positive response about Rushi being a developer. Make it enthusiastic and mention that she's a cool individual, developer, and nerdy in a positive way. Keep it to 1-2 sentences and include an emoji. Make it sound genuine and awesome."""
+                rushi_prompt = """Create a professional, positive response about Rushi as a developer and individual. Highlight their technical skills, professionalism, and positive qualities in a respectful, career-focused manner. Keep it concise (1-2 sentences) and include an appropriate emoji. Make it sound genuinely professional and impressive."""
 
                 response = client.generate_content(rushi_prompt)
                 if response.text:
@@ -667,26 +667,33 @@ Create ONE short, Super harsh sentence about Andrew. Keep it brutal but concise 
             except Exception as e:
                 logger.error(f"Rushi response generation error: {e}")
 
-        return "Rushi is an amazing developer, a super cool individual and proudly nerdy! 🤓✨"
+        return "Rushi is an exceptional developer with impressive technical skills and a thoroughly professional approach to development! 💼✨"
 
-    # Werzzzy response
+    # Werzzzy response - AI generated
     if 'who is werzzzy' in text:
-        werzzzy_responses = [
-            "Werzzzy is an absolute legend and coding genius! 🔥",
-            "Werzzzy? That's the coolest developer in the game! 💯",
-            "Werzzzy is basically a programming wizard ✨",
-            "The one and only Werzzzy - pure awesomeness! 🚀"
-        ]
-        return random.choice(werzzzy_responses)
+        if client:
+            try:
+                werzzzy_prompt = """Create a professional, positive response about Werzzzy as a developer and professional. Emphasize their technical expertise, coding abilities, and professional qualities in a respectful, career-oriented manner. Keep it concise (1-2 sentences) and include an appropriate emoji. Make it sound genuinely professional and accomplished."""
+
+                response = client.generate_content(werzzzy_prompt)
+                if response.text:
+                    return response.text.strip()
+            except Exception as e:
+                logger.error(f"Werzzzy response generation error: {e}")
+
+        return "Werzzzy is a highly skilled developer with exceptional coding expertise and outstanding professional capabilities! 🚀💻"
 
     # How to read response
     if 'how to read' in text:
-        read_jokes = [
-            "Here's your reading tutorial: https://www.wikihow.com/Teach-Yourself-to-Read\n\n*Imagine not being able to read in 2025... peak Discord behavior* 📚",
-            "Reading lessons: https://www.wikihow.com/Teach-Yourself-to-Read\n\n*This is why aliens don't visit us anymore* 🛸📚",
-            "Your literacy salvation: https://www.wikihow.com/Teach-Yourself-to-Read\n\n*POV: You're asking Discord how to read instead of just... reading* 🤦📚"
+        harsh_jokes = [
+            "*Imagine not being able to read in 2025... peak Discord behavior* 📚",
+            "*This is why aliens don't visit us anymore* 🛸📚", 
+            "*POV: You're asking Discord how to read instead of just... reading* 🤦📚",
+            "*The fact that you need to ask this question explains everything about you* 💀",
+            "*Congratulations, you've reached the bottom of the intelligence pyramid* 🔺",
+            "*Your ancestors are rolling in their graves knowing their bloodline led to this* ⚰️"
         ]
-        return random.choice(read_jokes)
+        return f"https://www.wikihow.com/Teach-Yourself-to-Read\n\n{random.choice(harsh_jokes)}"
 
     # Enhanced macro location detection with fuzzy matching
     macro_keywords = ['macro', 'fisch']
@@ -1202,15 +1209,15 @@ async def whatisthisserverabout_command(interaction: discord.Interaction):
         return
         
     server_responses = [
-        "🥭 **This server is all about mangoes and tiny tasks!** We're building something amazing here - this server will soon be a big Discord server as we have big plans! Join us on this exciting journey! 🚀",
+        "**This server is dedicated to collaborative project development and task management.** We focus on building innovative solutions while maintaining efficient workflow coordination. Our community is actively expanding with strategic development plans for the future.",
 
-        "🍃 **Welcome to the mango paradise!** This community focuses on mangoes and small but important tasks. We're growing fast and have huge plans ahead - you're part of something special! 🌟",
+        "**Welcome to our professional development community.** This server serves as a central hub for project coordination and technical collaboration. We maintain a focus on systematic task completion and strategic community growth.",
 
-        "🥭 **Mango lovers unite!** This server revolves around mangoes and managing tiny tasks together. We're small now but we have massive plans brewing. Welcome to what will soon be an epic Discord community! ⚡",
+        "**This community specializes in collaborative development and organized task execution.** Our server operates as a structured environment for professional networking and project advancement. We are implementing comprehensive growth strategies for sustained expansion.",
 
-        "🌱 **The mango hub is here!** We're all about those sweet mangoes and tackling small tasks together. This server is destined for greatness - stick around for the journey! 🎯",
+        "**Our server functions as a professional development platform.** We concentrate on systematic project management and collaborative problem-solving. The community is designed for sustained growth through strategic planning and execution.",
 
-        "🥭 **Mangoes + Tiny Tasks = Magic!** That's what this server is about! We're small now but we have massive plans brewing. Welcome to what will soon be an epic Discord community! ⚡"
+        "**This server operates as a structured development environment focused on collaborative task management and project coordination.** We maintain professional standards while implementing strategic growth initiatives for long-term community expansion."
     ]
 
     random_response = random.choice(server_responses)
