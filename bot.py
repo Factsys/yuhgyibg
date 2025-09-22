@@ -512,7 +512,7 @@ async def kick_new_account(member):
     try:
         days_remaining = 7 - (datetime.now(member.created_at.tzinfo) - member.created_at).days
         try:
-            await member.send(f"Please come back in {days_remaining} days. Only accounts 7+ days old can join this server.")
+            await member.send(f"⚠️ **Account Age Restriction**\n\nYour Discord account is too new to join this server. Please wait **{days_remaining} more days** and try again.\n\nOnly accounts that are 7+ days old can join. This helps protect our community from spam and trolls.\n\nThanks for understanding!")
         except Exception:
             logger.info(f"Could not DM {member} before auto-kick")
 
@@ -636,19 +636,14 @@ def get_knowledge_response(message_content):
                 ]
 
                 selected_category = random.choice(joke_categories)
-                joke_prompt = """Create a brutal one-liner roast about Andrew. Make it savage and cutting like these examples:
-"I'd agree with you, but then we'd both be wrong."
-"You're the reason the gene pool needs a lifeguard."
-"I've seen smarter cabinets at IKEA."
-"You bring everyone joy—when you leave the room."
-"Evolution saw you and pressed undo."
-"You're like a cloud—when you're gone, it's a beautiful day."
-"You're the human equivalent of a typo."
-"If clueless paid, you'd retire twice."
-"You're Monday in human form."
-"As useful as a knitted condom."
+                joke_prompt = """Create a brutal 2-3 sentence roast about Andrew. Make it savage and cutting like these examples:
+"I'd agree with you, but then we'd both be wrong. You're the reason the gene pool needs a lifeguard."
+"I've seen smarter cabinets at IKEA. You bring everyone joy—when you leave the room."
+"Evolution saw you and pressed undo. You're like a cloud—when you're gone, it's a beautiful day."
+"You're the human equivalent of a typo. If clueless paid, you'd retire twice."
+"You're Monday in human form. As useful as a knitted condom."
 
-Create ONE harsh, clever one-liner about Andrew. No emoji."""
+Create 2-3 harsh, clever sentences about Andrew. Keep it brutal but concise. No emoji."""
 
                 response = client.generate_content(joke_prompt)
                 if response.text:
@@ -721,16 +716,12 @@ Create ONE harsh, clever one-liner about Andrew. No emoji."""
     if (has_macro and has_where) or any(pattern in text for pattern in macro_patterns):
         return "**Fisch Macro:** https://discord.com/channels/1341949236471926804/1413837110770925578/1417999310443905116"
 
-    # Enhanced config location detection for rod configs
-    config_keywords = ['config', 'configs', 'rod', 'rods', 'settings']
+    # Enhanced config location detection for rod configs - more specific to avoid false positives
+    config_keywords = ['config', 'configs', 'settings']
+    rod_keywords = ['rod', 'rods']
     fisch_keywords = ['fisch', 'macro']
 
-    # Check if text contains config-related words
-    has_config = any(keyword in text for keyword in config_keywords)
-    has_fisch = any(keyword in text for keyword in fisch_keywords)
-    has_where_config = any(keyword in text for keyword in where_keywords)
-
-    # Also check for specific patterns
+    # More specific patterns to avoid false positives
     config_patterns = [
         'where can i find the config',
         'where can i find the fisch config',
@@ -742,10 +733,21 @@ Create ONE harsh, clever one-liner about Andrew. No emoji."""
         'configs for rod',
         'fisch rod config',
         'macro config',
-        'where rod settings'
+        'where rod settings',
+        'rod configs',
+        'fisch rod configs'
     ]
 
-    if ((has_config and has_fisch) or (has_config and has_where_config)) or any(pattern in text for pattern in config_patterns):
+    # Only trigger if it's asking for configs specifically, not just mentioning config in context
+    has_config_request = any(pattern in text for pattern in config_patterns)
+    has_rod_and_config = any(rod in text for rod in rod_keywords) and any(config in text for config in config_keywords)
+    has_fisch_and_config = any(fisch in text for fisch in fisch_keywords) and any(config in text for config in config_keywords)
+
+    # Add explicit check for question words to ensure it's actually asking for configs
+    question_indicators = ['where', 'how', 'find', 'get', 'need', 'want', 'link', 'location']
+    has_question = any(q in text for q in question_indicators)
+
+    if has_config_request or ((has_rod_and_config or has_fisch_and_config) and has_question):
         return "**Fisch Rod Configs:** https://discord.com/channels/1341949236471926804/1411335491457913014"
 
     # Mango/Fisch macro location
@@ -961,23 +963,120 @@ Provide a substantive, evidence-based response under 1800 characters. Focus on a
         logger.error(f"AskBloom error: {e}")
         await interaction.followup.send("❌ Something went wrong. Try again!")
 
-@bot.tree.command(name="ban", description="Ban a user (Admin only)")
-@app_commands.describe(user="User to ban")
-async def ban_command(interaction: discord.Interaction, user: discord.Member):
+@bot.tree.command(name="ban", description="Ban/Unban a user (Admin only)")
+@app_commands.describe(user="User to ban or unban", reason="Optional reason for the action")
+async def ban_command(interaction: discord.Interaction, user: discord.User, reason: str = None):
     if not is_admin_user(interaction.user.id):
         await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
         return
 
     try:
-        await user.ban(reason=f"Banned by {interaction.user.name}")
-        await interaction.response.send_message(f"✅ Banned {user.mention}")
-        # Log the ban
-        try:
-            await log_moderation_action('ban', interaction.user, user, reason=f'Banned by {interaction.user.name}')
-        except Exception as e:
-            logger.error(f"Failed to log ban action: {e}")
+        # Check if user is already banned
+        banned_users = [ban_entry async for ban_entry in interaction.guild.bans()]
+        is_banned = any(ban_entry.user.id == user.id for ban_entry in banned_users)
+        
+        action_reason = reason or f"Action by {interaction.user.name}"
+        
+        if is_banned:
+            # User is banned, so unban them
+            await interaction.guild.unban(user, reason=action_reason)
+            await interaction.response.send_message(f"✅ Unbanned {user.mention}")
+            # Log the unban
+            try:
+                await log_moderation_action('unban', interaction.user, user, reason=action_reason)
+            except Exception as e:
+                logger.error(f"Failed to log unban action: {e}")
+        else:
+            # User is not banned, so ban them (works even if user not in server)
+            await interaction.guild.ban(user, reason=action_reason)
+            await interaction.response.send_message(f"✅ Banned {user.mention}")
+            # Log the ban
+            try:
+                await log_moderation_action('ban', interaction.user, user, reason=action_reason)
+            except Exception as e:
+                logger.error(f"Failed to log ban action: {e}")
+                
     except Exception as e:
-        await interaction.response.send_message(f"❌ Failed to ban user: {e}", ephemeral=True)
+        await interaction.response.send_message(f"❌ Failed to perform action: {e}", ephemeral=True)
+
+@bot.tree.command(name="banpurge", description="Mass ban multiple users by ID (Admin only)")
+@app_commands.describe(user_list="Comma-separated list of user IDs to ban (e.g., 123456,789012,345678)", reason="Optional reason for the bans")
+async def banpurge_command(interaction: discord.Interaction, user_list: str, reason: str = None):
+    if not is_admin_user(interaction.user.id):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+    
+    # Parse the user list - remove spaces and split by comma
+    user_ids = [uid.strip() for uid in user_list.split(',') if uid.strip()]
+    
+    if not user_ids:
+        await interaction.followup.send("❌ No valid user IDs provided.")
+        return
+    
+    action_reason = reason or f"Mass ban by {interaction.user.name}"
+    banned_count = 0
+    failed_count = 0
+    results = []
+    
+    for user_id_str in user_ids:
+        try:
+            # Convert to integer ID
+            user_id = int(user_id_str)
+            
+            # Fetch user by ID (works even if not in server)
+            try:
+                user = await bot.fetch_user(user_id)
+            except discord.NotFound:
+                results.append(f"❌ User ID {user_id} not found")
+                failed_count += 1
+                continue
+            except discord.HTTPException:
+                results.append(f"❌ Failed to fetch user ID {user_id}")
+                failed_count += 1
+                continue
+            
+            # Check if already banned
+            banned_users = [ban_entry async for ban_entry in interaction.guild.bans()]
+            is_banned = any(ban_entry.user.id == user.id for ban_entry in banned_users)
+            
+            if is_banned:
+                results.append(f"⚠️ {user.display_name} (ID: {user.id}) already banned")
+                continue
+            
+            # Ban the user
+            await interaction.guild.ban(user, reason=action_reason)
+            results.append(f"✅ Banned {user.display_name} (ID: {user.id})")
+            banned_count += 1
+            
+            # Log the ban
+            try:
+                await log_moderation_action('ban', interaction.user, user, reason=action_reason)
+            except Exception as log_error:
+                logger.error(f"Failed to log ban for {user.id}: {log_error}")
+                
+        except ValueError:
+            results.append(f"❌ Invalid user ID: {user_id_str}")
+            failed_count += 1
+        except discord.Forbidden:
+            results.append(f"❌ No permission to ban user ID {user_id_str}")
+            failed_count += 1
+        except Exception as e:
+            results.append(f"❌ Error banning {user_id_str}: {str(e)}")
+            failed_count += 1
+    
+    # Send summary
+    summary = f"**Mass Ban Complete**\n✅ Successfully banned: {banned_count}\n❌ Failed: {failed_count}\n\n"
+    
+    # Add detailed results (truncate if too long)
+    detailed_results = "\n".join(results)
+    if len(summary + detailed_results) > 2000:
+        # Truncate detailed results to fit Discord's message limit
+        remaining_length = 2000 - len(summary) - 20  # Leave room for "..."
+        detailed_results = detailed_results[:remaining_length] + "..."
+    
+    await interaction.followup.send(summary + detailed_results)
 
 @bot.tree.command(name="namepersist", description="Force a user to keep a specific nickname (Admin only)")
 @app_commands.describe(user="User to enforce nickname on", nickname="Nickname to enforce")
@@ -1159,7 +1258,7 @@ async def listofkeywords_command(interaction: discord.Interaction):
         return
 
     if not keywords_data:
-        embed = discord.Embed(title="📝 Keywords List", description="()", color=0x3498db)
+        embed = discord.Embed(description="()", color=0x3498db)
         await interaction.response.send_message(embed=embed)
         return
     
@@ -1167,7 +1266,7 @@ async def listofkeywords_command(interaction: discord.Interaction):
     keyword_names = list(keywords_data.keys())
     formatted_list = "(" + ",".join(keyword_names) + ")"
     
-    embed = discord.Embed(title="📝 Keywords List", description=formatted_list, color=0x3498db)
+    embed = discord.Embed(description=formatted_list, color=0x3498db)
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="deletekeywords", description="Delete a keyword by name (Admin only)")
