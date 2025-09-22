@@ -113,19 +113,21 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Persistent data storage
 # -----------------------------
 persistent_names = {}  # user_id: enforced_nickname
+keywords_data = {}  # keyword_name: {'detection_text': str, 'response_text': str, 'img': str, 'link': str}
 
 def load_persistent_data():
-    global persistent_names
+    global persistent_names, keywords_data
     try:
         with open('persistent_data.json', 'r') as f:
             data = json.load(f)
             persistent_names = data.get('names', {})
+            keywords_data = data.get('keywords', {})
     except FileNotFoundError:
         pass
 
 def save_persistent_data():
     with open('persistent_data.json', 'w') as f:
-        json.dump({'names': persistent_names}, f)
+        json.dump({'names': persistent_names, 'keywords': keywords_data}, f)
 
 load_persistent_data()
 
@@ -616,12 +618,7 @@ def get_knowledge_response(message_content):
     """Get response based on new knowledge base"""
     text = message_content.lower()
 
-    # Check deterministic FAQ first
-    faq_answer = find_faq_answer(message_content)
-    if faq_answer:
-        return faq_answer
-
-    # Andrew joke response - only for "who is andrew"
+    # Andrew joke response - only for "who is andrew" (check before FAQ)
     if 'who is andrew' in text:
         # prevent abusive roasts or slurs
         if is_disallowed_context(text):
@@ -648,6 +645,11 @@ def get_knowledge_response(message_content):
                 logger.error(f"Andrew joke generation error: {e}")
 
         return "Andrew? Just some random person nobody cares about! 🤷"
+
+    # Check deterministic FAQ after special cases
+    faq_answer = find_faq_answer(message_content)
+    if faq_answer:
+        return faq_answer
 
     # Rushi response - AI generated
     if 'who is rushi' in text:
@@ -799,6 +801,33 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
+    # Check for exact keyword matches first
+    message_text = message.content.strip()
+    
+    for keyword_name, keyword_data in keywords_data.items():
+        detection_text = keyword_data['detection_text']
+        
+        # Check for EXACT match (case-insensitive)
+        if message_text.casefold() == detection_text.casefold():
+            response_parts = []
+            
+            # Add response text if available
+            if keyword_data['response_text']:
+                response_parts.append(keyword_data['response_text'])
+            
+            # Add image if available
+            if keyword_data['img']:
+                response_parts.append(keyword_data['img'])
+            
+            # Add link if available  
+            if keyword_data['link']:
+                response_parts.append(keyword_data['link'])
+            
+            # Send response if we have anything to send
+            if response_parts:
+                await message.reply('\n'.join(response_parts))
+                return  # Don't process other responses
+    
     # Respond to DMs or mentions
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = bot.user in message.mentions
@@ -1071,6 +1100,78 @@ async def whatisthisserverabout_command(interaction: discord.Interaction):
 
     random_response = random.choice(server_responses)
     await interaction.response.send_message(random_response)
+
+@bot.tree.command(name="keyword", description="Add a keyword detection trigger (Admin only)")
+@app_commands.describe(
+    detection_text="Exact text to detect",
+    name_of_keyword="Name identifier for this keyword",
+    text="Optional response text",
+    img="Optional image URL",
+    link="Optional link URL"
+)
+async def keyword_command(interaction: discord.Interaction, detection_text: str, name_of_keyword: str, text: str = None, img: str = None, link: str = None):
+    if not is_admin_user(interaction.user.id):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+
+    global keywords_data
+    
+    # Validate that at least one response is provided
+    if not any([text, img, link]):
+        await interaction.response.send_message("❌ You must provide at least one response (text, img, or link).", ephemeral=True)
+        return
+    
+    # Store the keyword data
+    keywords_data[name_of_keyword] = {
+        'detection_text': detection_text.strip(),
+        'response_text': text or '',
+        'img': img or '',
+        'link': link or ''
+    }
+    
+    save_persistent_data()
+    
+    response_parts = [f"✅ Keyword '{name_of_keyword}' added with detection text: '{detection_text}'"]
+    if text:
+        response_parts.append(f"Response: {text}")
+    if img:
+        response_parts.append(f"Image: {img}")
+    if link:
+        response_parts.append(f"Link: {link}")
+    
+    await interaction.response.send_message("\n".join(response_parts), ephemeral=True)
+
+@bot.tree.command(name="listofkeywords", description="List all configured keywords (Admin only)")
+async def listofkeywords_command(interaction: discord.Interaction):
+    if not is_admin_user(interaction.user.id):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+
+    if not keywords_data:
+        await interaction.response.send_message("()", ephemeral=True)
+        return
+    
+    # Format as requested: (name,name,name,name,name,name,name) with no spaces
+    keyword_names = list(keywords_data.keys())
+    formatted_list = "(" + ",".join(keyword_names) + ")"
+    
+    await interaction.response.send_message(formatted_list, ephemeral=True)
+
+@bot.tree.command(name="deletekeywords", description="Delete a keyword by name (Admin only)")
+@app_commands.describe(name_of_keyword="Name of the keyword to delete")
+async def deletekeywords_command(interaction: discord.Interaction, name_of_keyword: str):
+    if not is_admin_user(interaction.user.id):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+
+    global keywords_data
+    
+    if name_of_keyword in keywords_data:
+        del keywords_data[name_of_keyword]
+        save_persistent_data()
+        await interaction.response.send_message(f"✅ Keyword '{name_of_keyword}' deleted.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ Keyword '{name_of_keyword}' not found.", ephemeral=True)
 
 # -----------------------------
 # Web server for deployment
