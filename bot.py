@@ -516,15 +516,22 @@ async def kick_new_account(member):
         except Exception:
             logger.info(f"Could not DM {member} before auto-kick")
 
+        # Ensure we're only kicking, not banning
         await member.kick(reason="Account too new (< 7 days)")
-        logger.info(f"Kicked {member} - account too new")
+        logger.info(f"Successfully KICKED (not banned) {member} - account too new")
+        
         # Log to moderation channel
         try:
             await log_moderation_action('kick', 'Bloom (auto-kick)', member, reason='Account < 7 days old')
         except Exception as e:
             logger.error(f"Failed to log auto-kick action: {e}")
+            
+    except discord.Forbidden:
+        logger.error(f"No permission to kick {member}")
+    except discord.HTTPException as e:
+        logger.error(f"HTTP error kicking {member}: {e}")
     except Exception as e:
-        logger.error(f"Failed to kick {member}: {e}")
+        logger.error(f"Unexpected error kicking {member}: {e}")
 
 # -----------------------------
 # FAQ loader and utility helpers
@@ -980,7 +987,7 @@ async def ban_command(interaction: discord.Interaction, user: discord.User, reas
         if is_banned:
             # User is banned, so unban them
             await interaction.guild.unban(user, reason=action_reason)
-            await interaction.response.send_message(f"✅ Unbanned {user.mention}")
+            await interaction.response.send_message(f"✅ **Unbanned** {user.mention}")
             # Log the unban
             try:
                 await log_moderation_action('unban', interaction.user, user, reason=action_reason)
@@ -989,7 +996,7 @@ async def ban_command(interaction: discord.Interaction, user: discord.User, reas
         else:
             # User is not banned, so ban them (works even if user not in server)
             await interaction.guild.ban(user, reason=action_reason)
-            await interaction.response.send_message(f"✅ Banned {user.mention}")
+            await interaction.response.send_message(f"✅ **Banned** {user.mention}")
             # Log the ban
             try:
                 await log_moderation_action('ban', interaction.user, user, reason=action_reason)
