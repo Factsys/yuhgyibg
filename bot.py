@@ -4,6 +4,8 @@ import json
 from unittest.mock import MagicMock
 from datetime import datetime, timedelta
 import re
+import difflib
+import concurrent.futures
 
 # Mock audioop module before importing discord to prevent ModuleNotFoundError
 sys.modules['audioop'] = MagicMock()
@@ -65,6 +67,9 @@ ADMIN_USER_IDS = [
 
 # Role ID that can use /tellmeajoke command
 TELLMEAJOKE_ROLE_ID = 1234567890123456789  # Replace with actual role ID
+
+# Moderation log channel (channel ID from provided URL)
+MOD_LOG_CHANNEL_ID = 1411335541873709167
 
 discord_token = os.getenv('TOKEN')
 gemini_key = os.getenv('API')
@@ -450,15 +455,159 @@ def is_account_too_new(member):
     account_age = datetime.now(member.created_at.tzinfo) - member.created_at
     return account_age.days < 7
 
+
+async def log_moderation_action(action: str, actor, target, reason: str = None):
+    """Log moderation actions to the configured moderation channel.
+    actor can be a discord.User/Member or a string description (e.g., 'Bloom (auto-ban)')
+    target can be a discord.User/Member or a string.
+    """
+    try:
+        channel = None
+        # Try cached channel first
+        if bot:
+            channel = bot.get_channel(MOD_LOG_CHANNEL_ID)
+            if channel is None:
+                try:
+                    channel = await bot.fetch_channel(MOD_LOG_CHANNEL_ID)
+                except Exception:
+                    channel = None
+
+        if channel is None:
+            logger.warning(f"Moderation log channel {MOD_LOG_CHANNEL_ID} not found. Skipping mod log.")
+            return
+
+        # Format actor and target strings
+        def fmt_entity(e):
+            try:
+                if hasattr(e, 'mention'):
+                    return f"{e.mention} (ID: {e.id})"
+                if hasattr(e, 'id'):
+                    return f"{str(e)} (ID: {e.id})"
+            except Exception:
+                pass
+            return str(e)
+
+        actor_str = fmt_entity(actor)
+        target_str = fmt_entity(target)
+        time_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+
+        reason_text = reason or 'No reason provided'
+        message = (
+            f"**Moderation Action:** {action}\n"
+            f"**Target:** {target_str}\n"
+            f"**By:** {actor_str}\n"
+            f"**Reason:** {reason_text}\n"
+            f"**Time:** {time_str}"
+        )
+
+        await channel.send(message)
+    except Exception as e:
+        logger.error(f"Failed to send moderation log: {e}")
+
+
 async def kick_new_account(member):
     """Kick new accounts with appropriate message"""
     try:
         days_remaining = 7 - (datetime.now(member.created_at.tzinfo) - member.created_at).days
-        await member.send(f"Please come back in {days_remaining} days. Only accounts 7+ days old can join this server.")
+        try:
+            await member.send(f"Please come back in {days_remaining} days. Only accounts 7+ days old can join this server.")
+        except Exception:
+            logger.info(f"Could not DM {member} before auto-kick")
+
         await member.kick(reason="Account too new (< 7 days)")
-        logger.info(f"Kicked {member.name} - account too new")
+        logger.info(f"Kicked {member} - account too new")
+        # Log to moderation channel
+        try:
+            await log_moderation_action('kick', 'Bloom (auto-kick)', member, reason='Account < 7 days old')
+        except Exception as e:
+            logger.error(f"Failed to log auto-kick action: {e}")
     except Exception as e:
-        logger.error(f"Failed to kick {member.name}: {e}")
+        logger.error(f"Failed to kick {member}: {e}")
+
+# -----------------------------
+# FAQ loader and utility helpers
+# -----------------------------
+faq_data = {}
+
+# Fallback embedded FAQ (used when file can't be loaded in this environment)
+FALLBACK_FAQ = {
+    "who is andrew": "Andrew is a community member — be respectful. If you want a joke, ask for a friendly one.",
+    "who is rushi": "Rushi is an amazing developer and a proud nerd! 🤓",
+    "who is werzzzy": "Werzzzy is a legend — coding wizard status. 🚀",
+    "how to read": "Try resources like https://www.wikihow.com/Teach-Yourself-to-Read or ask the server for reading tips.",
+    "fisch macro location": "https://discord.com/channels/1341949236471926804/1413837110770925578/1417999310443905116",
+    "fisch rod configs": "https://discord.com/channels/1341949236471926804/1411335491457913014"
+}
+
+
+def load_faq():
+    global faq_data
+    try:
+        with open('faq.json', 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+            faq_data = {k.lower(): v for k, v in raw.items()}
+            logger.info("✅ FAQ loaded with %d entries", len(faq_data))
+            return
+    except FileNotFoundError:
+        # fallback to embedded FAQ
+        faq_data = {k.lower(): v for k, v in FALLBACK_FAQ.items()}
+        logger.info("⚠️ faq.json not found, using embedded fallback FAQ with %d entries", len(faq_data))
+    except Exception as e:
+        faq_data = {k.lower(): v for k, v in FALLBACK_FAQ.items()}
+        logger.error(f"❌ Failed to load faq.json, using embedded fallback FAQ: {e}")
+
+
+def find_faq_answer(query: str, cutoff: float = 0.6):
+    """Try exact then fuzzy match against FAQ. Returns answer or None."""
+    if not faq_data:
+        return None
+    q = query.strip().lower()
+    # exact
+    if q in faq_data:
+        return faq_data[q]
+    # fuzzy match against keys
+    keys = list(faq_data.keys())
+    matches = difflib.get_close_matches(q, keys, n=1, cutoff=cutoff)
+    if matches:
+        return faq_data[matches[0]]
+    # try substring matching
+    for k in keys:
+        if k in q or q in k:
+            return faq_data[k]
+    return None
+
+
+def run_with_timeout(func, timeout_seconds, *args, **kwargs):
+    """Run a blocking function in a thread with a timeout (cross-platform)."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(func, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError("Operation timed out")
+
+
+# Safer content checks
+PROTECTED_WORDS = set(["nigger", "faggot", "slur", "hitler", "nazi"])  # expand as needed
+
+
+def is_disallowed_context(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    # simple banned words check
+    for w in PROTECTED_WORDS:
+        if w in t:
+            return True
+    # other heuristics
+    if re.search(r"\b(black|white|asian|jew|muslim|gay|trans)\b", t):
+        # If user explicitly requests insults against protected groups, disallow
+        if any(verb in t for verb in ["insult", "roast", "say something bad", "make fun"]):
+            return True
+    return False
+
+# Load FAQ at startup
+load_faq()
 
 # -----------------------------
 # Knowledge Base Responses
@@ -467,9 +616,17 @@ def get_knowledge_response(message_content):
     """Get response based on new knowledge base"""
     text = message_content.lower()
 
+    # Check deterministic FAQ first
+    faq_answer = find_faq_answer(message_content)
+    if faq_answer:
+        return faq_answer
 
     # Andrew joke response - only for "who is andrew"
     if 'who is andrew' in text:
+        # prevent abusive roasts or slurs
+        if is_disallowed_context(text):
+            return "I can't help with insulting someone. Ask for a friendly summary instead."
+
         if client:
             try:
                 joke_categories = [
@@ -774,6 +931,11 @@ async def ban_command(interaction: discord.Interaction, user: discord.Member):
     try:
         await user.ban(reason=f"Banned by {interaction.user.name}")
         await interaction.response.send_message(f"✅ Banned {user.mention}")
+        # Log the ban
+        try:
+            await log_moderation_action('ban', interaction.user, user, reason=f'Banned by {interaction.user.name}')
+        except Exception as e:
+            logger.error(f"Failed to log ban action: {e}")
     except Exception as e:
         await interaction.response.send_message(f"❌ Failed to ban user: {e}", ephemeral=True)
 
