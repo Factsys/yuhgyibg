@@ -1562,7 +1562,11 @@ def start_bot(token=None):
         logger.error("TOKEN not found. Cannot start bot.")
         return
 
-    # Note: Flask server is handled by main.py, not here
+    # Start Flask server in a separate thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("🌐 Flask server started on port 5000")
+
     logger.info("🤖 Starting Discord bot...")
 
     import time
