@@ -710,7 +710,12 @@ def get_knowledge_response_for_channel(message_content, channel_id):
     # Allowed channel IDs for keyword responses
     ALLOWED_CHANNELS = [
         1411335434721820703,  # First channel
-        1409580331735974009   # Second channel from the URL
+        1409580331735974009,  # Second channel from the URL
+        1411335492875583578,  # Additional channel 1
+        1411335494234669076,  # Additional channel 2
+        1411335495941619733,  # Additional channel 3
+        1411335497699033088,  # Additional channel 4
+        1411335498945003654   # Additional channel 5
     ]
     
     # If not in allowed channels, only allow special responses (Andrew, Rushi, etc.)
