@@ -705,6 +705,69 @@ def has_exact_keyword(text_to_check, keyword):
 # -----------------------------
 # Knowledge Base Responses
 # -----------------------------
+def get_knowledge_response_for_channel(message_content, channel_id):
+    """Get response based on knowledge base with channel restrictions"""
+    # Allowed channel IDs for keyword responses
+    ALLOWED_CHANNELS = [
+        1411335434721820703,  # First channel
+        1409580331735974009   # Second channel from the URL
+    ]
+    
+    # If not in allowed channels, only allow special responses (Andrew, Rushi, etc.)
+    if channel_id not in ALLOWED_CHANNELS:
+        text = message_content.lower()
+        
+        # Only allow these special responses in any channel
+        if has_exact_keyword(text, 'who is andrew'):
+            if is_disallowed_context(text):
+                return "I can't help with insulting someone. Ask for a friendly summary instead."
+
+            if client:
+                try:
+                    joke_prompt = """Roast Andrew with a brutal, Discord-mod-tier insult.  
+Start with a harsh intro like "Oh Andrew, that guy..." or "Andrew? That walking..." or come up with your own idea then absolutely tear him apart.  
+
+⚡ Rules:  
+- ONE savage line only  
+- Must begin with a harsh introductory phrase about Andrew  
+- Be condescending, petty, and devastatingly funny  
+- Keep it short, like a Discord roast  
+- No emojis, no fluff  
+
+Examples:  
+"Oh Andrew, that guy who peaked in kindergarten..."  
+"Andrew? That walking disappointment who..."  
+"Oh you mean Andrew, the human equivalent of lag..."  
+"Andrew... that guy who makes everyone appreciate silence..."  
+"""
+
+                    response = client.generate_content(joke_prompt)
+                    if response.text:
+                        return response.text.strip()
+                except Exception as e:
+                    logger.error(f"Andrew joke generation error: {e}")
+
+            return "Oh Andrew, that guy nobody really cares about! 🤷"
+
+        # Rushi response
+        if has_exact_keyword(text, 'who is rushi'):
+            return "The owner of this discord server"
+
+        # Werzzzy response
+        if has_exact_keyword(text, 'who is werzzzy'):
+            return "The creator of this discord bot"
+        
+        # FAQ responses are allowed everywhere
+        faq_answer = find_faq_answer(message_content)
+        if faq_answer:
+            return faq_answer
+            
+        # No other responses for non-allowed channels
+        return None
+    
+    # For allowed channels, run full knowledge base
+    return get_knowledge_response(message_content)
+
 def get_knowledge_response(message_content):
     """Get response based on new knowledge base"""
     text = message_content.lower()
@@ -845,11 +908,32 @@ Examples:
                             or 'find' in text):
         return "Fisch macro: https://discord.com/channels/1341949236471926804/1413837110770925578/1417999310443905116"
 
-    # General Issues Keywords
-    if any(
-            has_exact_keyword(text, keyword)
-            for keyword in ['ahk', 'autohotkey', 'auto hotkey']):
+    # General Issues Keywords with regex patterns
+    # AHK version questions
+    ahk_patterns = [
+        r'\bwhat\s+(is\s+the\s+)?ahk\s+(version|ver)\b',
+        r'\bwhich\s+ahk\s+(version|ver)\b',
+        r'\bahk\s+(version|ver)\s+(for|to use)\b',
+        r'\bautohotkey\s+(version|ver)\b',
+        r'\bwhat\s+autohotkey\b',
+        r'\bwrong\s+ahk\b',
+        r'\bahk\s+not\s+working\b'
+    ]
+    if any(re.search(pattern, text) for pattern in ahk_patterns):
         return "**AutoHotkey Version:** Use AHK v1.1 (NOT v2) - v2 is not supported for the current fisch macro."
+
+    # Settings questions
+    settings_patterns = [
+        r'\bwhat\s+(are\s+the\s+)?settings\b',
+        r'\broblox\s+settings\b',
+        r'\bsettings\s+(for|to\s+use)\b',
+        r'\bwhat\s+settings\s+should\b',
+        r'\bhow\s+to\s+set\s+settings\b',
+        r'\bconfigure\s+settings\b',
+        r'\bgame\s+settings\b'
+    ]
+    if any(re.search(pattern, text) for pattern in settings_patterns):
+        return "**Roblox Settings:** Fullscreen OFF, graphics 1, dark avatar, brightness/saturation OFF, disable camera shake."
 
     if any(
             has_exact_keyword(text, keyword) for keyword in
@@ -863,11 +947,6 @@ Examples:
 
     if any(
             has_exact_keyword(text, keyword)
-            for keyword in ['roblox settings', 'settings']):
-        return "**Roblox Settings:** Fullscreen OFF, graphics 1, dark avatar, brightness/saturation OFF, disable camera shake."
-
-    if any(
-            has_exact_keyword(text, keyword)
             for keyword in ['install', 'installation']):
         return "**Installation Issues:** If AHK fails, uninstall & reinstall. Check antivirus/browser blocking IRUS."
 
@@ -875,6 +954,22 @@ Examples:
             has_exact_keyword(text, keyword) for keyword in
         ['moved forward', 'moving forward', 'move forward']):
         return "**Being Moved Forward:** Cause = click-to-move enabled or failed catch. Fix = disable click-to-move, use better rods+bait+configs to reduce fails."
+
+    # Enhanced macro location detection with more variations
+    macro_patterns = [
+        'where can i find the fisch macro', 'where fisch macro', 'where macro',
+        'where fisch', 'fisch macro location', 'macro location', 'macro fisch',
+        'fisch macro link', 'get macro', 'download macro', 'find macro',
+        'macro link', 'wheres mango', "where's mango", 'where is mango',
+        "where's the macro", 'where the macro', 'wheres the macro',
+        'where can i find the macro', 'where can i get the macro',
+        'how to get macro', 'link to macro', 'macro download link',
+        'where to download macro', 'where to find macro'
+    ]
+
+    # Only trigger if it's an exact match for one of these patterns
+    if any(has_exact_keyword(text, pattern) for pattern in macro_patterns):
+        return "**Fisch Macro:** https://discord.com/channels/1341949236471926804/1413837110770925578/1417999310443905116"
 
     # Debugging Flow
     if any(
@@ -927,7 +1022,7 @@ async def on_message(message):
         return
 
     # Check knowledge base responses FIRST (for priority responses like "who is andrew")
-    knowledge_response = get_knowledge_response(message.content)
+    knowledge_response = get_knowledge_response_for_channel(message.content, message.channel.id)
     if knowledge_response:
         await message.reply(knowledge_response)
         return  # Don't process other responses
@@ -1024,7 +1119,7 @@ async def askbloom_command(interaction: discord.Interaction, question: str):
 
     try:
         # First check if it's a Fisch macro related question
-        knowledge_response = get_knowledge_response(question)
+        knowledge_response = get_knowledge_response_for_channel(question, interaction.channel.id)
 
         if knowledge_response:
             # Use existing knowledge base for Fisch-related questions
