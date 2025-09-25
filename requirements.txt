@@ -28,6 +28,7 @@ Jinja2==3.1.6
 MarkupSafe==3.0.2
 multidict==6.4.3
 newsapi-python==0.2.7
+openai==1.37.0
 propcache==0.3.1
 proto-plus==1.26.1
 protobuf==5.29.5
@@ -47,3 +48,14 @@ urllib3==2.5.0
 Werkzeug==3.1.3
 yarl==1.19.0
 aiohttp
+beautifulsoup4
+discord.py
+duckduckgo-search
+flask
+google-api-python-client
+newsapi-python
+openai
+requests
+trafilatura
+wikipedia
+yfinance
