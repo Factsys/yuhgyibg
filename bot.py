@@ -48,9 +48,17 @@ except ImportError:
     NewsApiClient = None
 
 try:
-    import google.generativeai as genai
+    from openai import OpenAI
 except ImportError:
-    genai = None
+    OpenAI = None
+
+import requests
+import json
+
+try:
+    from googleapiclient.discovery import build
+except ImportError:
+    build = None
 
 # -----------------------------
 # Setup
@@ -72,8 +80,20 @@ TELLMEAJOKE_ROLE_ID = 1234567890123456789  # Replace with actual role ID
 MOD_LOG_CHANNEL_ID = 1411335541873709167
 
 discord_token = os.getenv('TOKEN')
-gemini_key = os.getenv('API')
+openrouter_key = os.getenv('API')  # DO NOT REMOVE - OpenRouter API key
 news_api_key = os.getenv('NEWS_API_KEY')  # Get from newsapi.org
+google_search_api_key = os.getenv('google')
+google_search_engine_id = "YOUR_SEARCH_ENGINE_ID"  # You'll need to get this from Google Custom Search
+
+# Initialize Google Custom Search service
+google_search_service = None
+if google_search_api_key and build:
+    try:
+        google_search_service = build("customsearch",
+                                      "v1",
+                                      developerKey=google_search_api_key)
+    except Exception as e:
+        logger.error(f"Google Search service init failed: {e}")
 
 # Initialize NewsAPI client if key exists
 news_client = None
@@ -89,17 +109,13 @@ elif not NewsApiClient:
 if not discord_token:
     logger.warning("⚠️ TOKEN not set!")
 
-if not gemini_key:
-    logger.warning("⚠️ GEMINI_API_KEY not set!")
+if not openrouter_key:
+    logger.warning("⚠️ OPENROUTER_API_KEY not set!")
 
 client = None
-if gemini_key:
-    try:
-        genai.configure(api_key=gemini_key)
-        client = genai.GenerativeModel('gemini-2.0-flash')
-        logger.info("✅ Gemini client initialized")
-    except Exception as e:
-        logger.error(f"❌ Gemini init failed: {e}")
+if openrouter_key:
+    client = "requests_client"  # Flag to use requests instead
+    logger.info("✅ OpenRouter client initialized")
 
 # -----------------------------
 # Bot setup
@@ -320,7 +336,27 @@ def multi_source_search(query: str) -> str:
     is_current_event = any(keyword in query_lower
                            for keyword in current_events_keywords)
 
-    # 1. PRIORITY: Enhanced news search for current events (if NewsAPI available)
+    # 1. PRIORITY: Google Custom Search Engine (if available)
+    if google_search_service and google_search_engine_id:
+        try:
+
+            def google_search():
+                return google_search_service.cse().list(
+                    q=query, cx=google_search_engine_id, num=3).execute()
+
+            search_result = run_with_timeout(google_search, 5)
+
+            if 'items' in search_result:
+                for item in search_result['items'][:3]:
+                    title = item.get('title', '')
+                    snippet = item.get('snippet', '')
+                    if title and snippet:
+                        results.append(f"**🔍 {title}**: {snippet}")
+
+        except (TimeoutError, Exception) as e:
+            logger.error(f"Google Custom Search error: {e}")
+
+    # 2. Enhanced news search for current events (if NewsAPI available)
     if news_client and (is_current_event or len(query.split()) <= 3):
         try:
             search_strategies = [
@@ -346,23 +382,17 @@ def multi_source_search(query: str) -> str:
 
             for strategy in search_strategies:
                 try:
-                    # Add timeout to news API calls
-                    import signal
 
-                    def timeout_handler(signum, frame):
-                        raise TimeoutError("News API timeout")
+                    def news_search():
+                        return news_client.get_everything(
+                            language='en',
+                            page_size=3,
+                            from_param=(
+                                datetime.now() -
+                                timedelta(days=30)).strftime('%Y-%m-%d'),
+                            **strategy)
 
-                    signal.signal(signal.SIGALRM, timeout_handler)
-                    signal.alarm(5)  # 5 second timeout
-
-                    news_results = news_client.get_everything(
-                        language='en',
-                        page_size=3,
-                        from_param=(datetime.now() -
-                                    timedelta(days=30)).strftime('%Y-%m-%d'),
-                        **strategy)
-
-                    signal.alarm(0)  # Cancel timeout
+                    news_results = run_with_timeout(news_search, 5)
 
                     if news_results['articles']:
                         for article in news_results['articles'][:2]:
@@ -373,56 +403,49 @@ def multi_source_search(query: str) -> str:
                             )
                         break
                 except (TimeoutError, Exception) as strategy_error:
-                    signal.alarm(0)  # Cancel timeout
                     logger.error(f"News strategy error: {strategy_error}")
                     continue
 
         except Exception as e:
             logger.error(f"Enhanced news search error: {e}")
 
-    # 2. DuckDuckGo search (if available) - with timeout
+    # 3. DuckDuckGo search (if available) - with timeout
     if DDGS and len(results) < 3:
         try:
-            import signal
 
-            def timeout_handler(signum, frame):
-                raise TimeoutError("DuckDuckGo timeout")
+            def ddg_search():
+                with DDGS() as ddgs:
+                    search_queries = [query]
 
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(8)  # 8 second timeout for DDG
+                    if is_current_event:
+                        search_queries.extend(
+                            [f"{query} 2024 2025", f"{query} news recent"])
 
-            with DDGS() as ddgs:
-                search_queries = [query]
+                    for search_query in search_queries[:2]:
+                        try:
+                            web_results = list(
+                                ddgs.text(search_query, max_results=2))
+                            for r in web_results:
+                                if len(results) < 4:
+                                    results.append(
+                                        f"**🌐 {r['title']}**: {r['body'][:150]}..."
+                                    )
 
-                if is_current_event:
-                    search_queries.extend(
-                        [f"{query} 2024 2025", f"{query} news recent"])
+                            if len(results) >= 3:
+                                break
 
-                for search_query in search_queries[:2]:
-                    try:
-                        web_results = list(
-                            ddgs.text(search_query, max_results=2))
-                        for r in web_results:
-                            if len(results) < 4:
-                                results.append(
-                                    f"**🌐 {r['title']}**: {r['body'][:150]}..."
-                                )
+                        except Exception as ddg_error:
+                            logger.error(
+                                f"DDG query '{search_query}' error: {ddg_error}")
+                            continue
+                return results
 
-                        if len(results) >= 3:
-                            break
-
-                    except Exception as ddg_error:
-                        logger.error(
-                            f"DDG query '{search_query}' error: {ddg_error}")
-                        continue
-
-            signal.alarm(0)  # Cancel timeout
+            run_with_timeout(ddg_search, 8)
 
         except (TimeoutError, Exception) as e:
-            signal.alarm(0)  # Cancel timeout
             logger.error(f"DuckDuckGo search error: {e}")
 
-    # 3. Basic web scraping fallback - with timeout
+    # 4. Basic web scraping fallback - with timeout
     if len(results) < 2:
         try:
             search_url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
@@ -448,7 +471,7 @@ def multi_source_search(query: str) -> str:
         except Exception as e:
             logger.error(f"Basic web search error: {e}")
 
-    # 4. Stock search (if yfinance available) - with timeout
+    # 5. Stock search (if yfinance available) - with timeout
     if yf and not is_current_event and any(
             keyword in query_lower for keyword in
         ['stock', 'price', 'shares', 'market', '$', 'nasdaq', 'dow', 'sp500']):
@@ -457,21 +480,17 @@ def multi_source_search(query: str) -> str:
             for word in words:
                 if len(word) <= 5 and word.isalpha():
                     try:
-                        ticker = yf.Ticker(word)
-                        # Set timeout for yfinance
-                        import signal
 
-                        def timeout_handler(signum, frame):
-                            raise TimeoutError("YFinance timeout")
+                        def get_stock_info():
+                            ticker = yf.Ticker(word)
+                            info = ticker.info
+                            current_price = info.get(
+                                'currentPrice') or info.get(
+                                    'regularMarketPrice')
+                            return info, current_price
 
-                        signal.signal(signal.SIGALRM, timeout_handler)
-                        signal.alarm(3)  # 3 second timeout
-
-                        info = ticker.info
-                        current_price = info.get('currentPrice') or info.get(
-                            'regularMarketPrice')
-
-                        signal.alarm(0)  # Cancel timeout
+                        info, current_price = run_with_timeout(
+                            get_stock_info, 3)
 
                         if current_price:
                             company_name = info.get('shortName', word)
@@ -480,32 +499,28 @@ def multi_source_search(query: str) -> str:
                             )
                             break
                     except (TimeoutError, Exception):
-                        signal.alarm(0)  # Cancel timeout
                         continue
         except Exception as e:
             logger.error(f"Stock search error: {e}")
 
-    # 5. Wikipedia search (if available) - with timeout
+    # 6. Wikipedia search (if available) - with timeout
     if wikipedia and (not is_current_event or len(results) < 2):
         try:
-            import signal
 
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Wikipedia timeout")
+            def wiki_search():
+                wiki_results = wikipedia.search(query, results=1)
+                if wiki_results:
+                    page = wikipedia.page(wiki_results[0])
+                    wiki_summary = wikipedia.summary(wiki_results[0],
+                                                     sentences=2)
+                    return page, wiki_summary
+                return None, None
 
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(4)  # 4 second timeout
-
-            wiki_results = wikipedia.search(query, results=1)
-            if wiki_results:
-                page = wikipedia.page(wiki_results[0])
-                wiki_summary = wikipedia.summary(wiki_results[0], sentences=2)
+            page, wiki_summary = run_with_timeout(wiki_search, 4)
+            if page and wiki_summary:
                 results.append(f"**📖 {page.title}**: {wiki_summary}")
 
-            signal.alarm(0)  # Cancel timeout
-
         except (TimeoutError, Exception):
-            signal.alarm(0)  # Cancel timeout
             pass
 
     return "\n\n".join(
@@ -609,6 +624,7 @@ async def kick_new_account(member):
 # FAQ loader and utility helpers
 # -----------------------------
 faq_data = {}
+
 
 def load_faq():
     global faq_data
@@ -715,13 +731,13 @@ def get_knowledge_response_for_channel(message_content, channel_id):
         1411335494234669076,  # Additional channel 2
         1411335495941619733,  # Additional channel 3
         1411335497699033088,  # Additional channel 4
-        1411335498945003654   # Additional channel 5
+        1411335498945003654  # Additional channel 5
     ]
-    
+
     # If not in allowed channels, only allow special responses (Andrew, Rushi, etc.)
     if channel_id not in ALLOWED_CHANNELS:
         text = message_content.lower()
-        
+
         # Only allow these special responses in any channel
         if has_exact_keyword(text, 'who is andrew'):
             if is_disallowed_context(text):
@@ -746,9 +762,14 @@ Examples:
 "Andrew... that guy who makes everyone appreciate silence..."  
 """
 
-                    response = client.generate_content(joke_prompt)
-                    if response.text:
-                        return response.text.strip()
+                    response = client.chat.completions.create(
+                        model="google/gemini-2.5-flash-preview-09-2025",
+                        messages=[{"role": "user", "content": joke_prompt}],
+                        max_tokens=500,
+                        temperature=0.9
+                    )
+                    if response.choices[0].message.content:
+                        return response.choices[0].message.content.strip()
                 except Exception as e:
                     logger.error(f"Andrew joke generation error: {e}")
 
@@ -761,21 +782,200 @@ Examples:
         # Werzzzy response
         if has_exact_keyword(text, 'who is werzzzy'):
             return "The creator of this discord bot"
-        
+
         # FAQ responses are allowed everywhere
         faq_answer = find_faq_answer(message_content)
         if faq_answer:
             return faq_answer
-            
+
         # No other responses for non-allowed channels
         return None
-    
+
     # For allowed channels, run full knowledge base
     return get_knowledge_response(message_content)
+
+
+def get_intelligent_response(message_content):
+    """Use AI to intelligently detect question intent and provide appropriate responses"""
+    if not client:
+        return None
+
+    try:
+        # AI prompt to detect question intent and extract key information
+        intent_prompt = f"""Analyze this Discord message and determine the user's intent. Respond with ONLY ONE of these exact formats:
+
+1. If asking about best rod for AFK/farming money: "AFK_MONEY_ROD"
+2. If asking about best rod in general (NOT for money/AFK): "BEST_ROD_GENERAL" 
+3. If asking about rod config FILES/links (NOT general settings): "CONFIG_REQUEST:[ROD_NAME]" (extract the rod name)
+4. If asking about rod config FILES but no specific rod mentioned: "CONFIG_REQUEST:GENERAL"
+5. If asking how to get/obtain a specific rod: "ROD_OBTAIN:[ROD_NAME]" (extract the rod name)
+6. If asking how to get rods in general: "ROD_OBTAIN:GENERAL"
+7. If asking if macros EXIST/are available for a rod: "MACRO_AVAILABILITY:[ROD_NAME]" (extract rod name)
+8. If asking about macro not working/technical problems: "MACRO_TROUBLESHOOT:[ROD_NAME]" (extract rod name if mentioned, otherwise "GENERAL")
+9. If asking about enchantments (lucky, control, hasty, etc.): "NO_MATCH"
+10. If none of the above: "NO_MATCH"
+
+Message: "{message_content}"
+
+Examples:
+- "best rod to afk money" → AFK_MONEY_ROD
+- "best rod to afk farm money" → AFK_MONEY_ROD  
+- "what is the best rod" → BEST_ROD_GENERAL
+- "anyone have ruinous oath config" → CONFIG_REQUEST:Ruinous Oath
+- "where is trident config" → CONFIG_REQUEST:Trident
+- "where is config" → CONFIG_REQUEST:GENERAL
+- "how to get polaris" → ROD_OBTAIN:Polaris
+- "how to get the no life rod" → ROD_OBTAIN:No Life
+- "how to get oscar rod" → ROD_OBTAIN:Oscar
+- "are there any boom ball rod macros" → MACRO_AVAILABILITY:Boom Ball
+- "do you have trident macros" → MACRO_AVAILABILITY:Trident
+- "any macros for seraphic rod" → MACRO_AVAILABILITY:Seraphic
+- "macro not working" → MACRO_TROUBLESHOOT:GENERAL
+- "why is my macro not working" → MACRO_TROUBLESHOOT:GENERAL
+- "macro buttons not clickable" → MACRO_TROUBLESHOOT:GENERAL
+- "macro not working with trident" → MACRO_TROUBLESHOOT:Trident
+- "should I sacrifice lucky for control enchant" → NO_MATCH
+- "what enchant should I use on rotd" → NO_MATCH
+- "lucky vs control enchant" → NO_MATCH"""
+
+        response = client.chat.completions.create(
+            model="google/gemini-2.5-flash-preview-09-2025",
+            messages=[{"role": "user", "content": intent_prompt}],
+            max_tokens=100,
+            temperature=0.3
+        )
+        if response.choices[0].message.content:
+            intent = response.choices[0].message.content.strip()
+
+            # Handle AFK money rod questions
+            if intent == "AFK_MONEY_ROD":
+                return """**Best AFK Rod for Money Farming:**
+
+Honestly, it depends on what you're aiming for:
+
+**Best AFK Rod:** Polaris Rod (overall the best for AFK fishing)
+
+**For XP:** Oscar Rod is the way to go
+
+**Good AFK spots:**
+• Castaway Cliffs (with Aurora active) – great all-around
+• Volcanic Vents (Daytime) – best for money  
+• Crystal Cove – solid for XP"""
+
+            # Handle config requests
+            elif intent.startswith("CONFIG_REQUEST:"):
+                rod_name = intent.split(":", 1)[1]
+                if rod_name == "GENERAL":
+                    return "**Fisch Rod Configs:** https://discord.com/channels/1341949236471926804/1411335491457913014"
+                else:
+                    return f"**The {rod_name} config should be here:** https://discord.com/channels/1341949236471926804/1411335491457913014\n\nIf it's not there, it hasn't been created yet."
+
+            # Handle rod obtain requests
+            elif intent.startswith("ROD_OBTAIN:"):
+                rod_name = intent.split(":", 1)[1].lower()
+
+                if rod_name == "general":
+                    return """**How to Obtain Fisch Rods:**
+
+**No Life Rod:** Available at level 500 as a level-requirement rod
+
+**Seraphic Rod:** Available at level 1000 as a level-requirement rod
+
+**Oscar Rod:** Complete a quest from an NPC in Forsaken Shores and pay 5 million C$. Perfect for XP grinding with Clever enchantment
+
+**Polaris Rod:** No longer obtainable - was a limited-time developer rod that required trading specific items to an NPC"""
+
+                elif "no life" in rod_name:
+                    return "**No Life Rod:** This is a level-requirement rod that becomes available when you reach the level cap of 500."
+
+                elif "seraphic" in rod_name:
+                    return "**Seraphic Rod:** This is a level-requirement rod that becomes available when you reach the level cap of 1000."
+
+                elif "oscar" in rod_name:
+                    return "**Oscar Rod:** Obtain this rod by completing a quest from an NPC located in Forsaken Shores. It costs 5 million C$ and is excellent for XP grinding due to the Clever enchantment doubling XP gains."
+
+                elif "polaris" in rod_name:
+                    return "**Polaris Rod:** This rod is no longer obtainable. It was a limited-time developer rod that was previously acquired by trading specific items to an NPC."
+
+                else:
+                    return None  # Don't respond if we don't have specific info about this rod
+
+            # Handle macro availability questions
+            elif intent.startswith("MACRO_AVAILABILITY:"):
+                rod_name = intent.split(":", 1)[1].lower()
+                return f"**{rod_name.title()} Macros:** I don't have info on specific macro availability. Check the macro channels or community resources for the latest {rod_name} macros!"
+
+            # Handle macro troubleshooting
+            elif intent.startswith("MACRO_TROUBLESHOOT:"):
+                rod_name = intent.split(":", 1)[1]
+
+                if not client:
+                    return "**Macro Issues:** Check your settings, make sure you're using the latest macro version, and verify you're using Web Roblox (not Microsoft Store version)."
+
+                try:
+                    # Generate AI response for macro troubleshooting
+                    if rod_name.lower() == "general":
+                        troubleshoot_prompt = """Generate a short, helpful response for macro troubleshooting in 1-2 sentences. Be concise and direct.
+
+User is having macro issues. Suggest:
+- Try restarting the macro
+- Using latest macro version
+- Use Web Roblox (not Microsoft Store)
+- Basic troubleshooting steps
+
+Keep it under 100 characters and casual/friendly tone. DO NOT mention configs or settings files."""
+                    else:
+                        troubleshoot_prompt = f"""Generate a short, helpful response for macro troubleshooting with the {rod_name} rod in 1-2 sentences. Be concise and direct.
+
+User is having macro issues with {rod_name} rod. Suggest:
+- Try restarting the macro
+- Check if using latest macro version  
+- Make sure you're using Web Roblox (not Microsoft Store)
+- Basic troubleshooting steps
+
+Keep it under 100 characters and casual/friendly tone. DO NOT mention configs or settings files."""
+
+                    response = client.chat.completions.create(
+                        model="google/gemini-2.5-flash-preview-09-2025",
+                        messages=[{"role": "user", "content": troubleshoot_prompt}],
+                        max_tokens=200,
+                        temperature=0.7
+                    )
+                    if response.choices[0].message.content:
+                        return response.choices[0].message.content.strip()
+                    else:
+                        # Fallback response
+                        if rod_name.lower() == "general":
+                            return "If the macro isn't working, try tweaking the settings and make sure you're using the latest version."
+                        else:
+                            return f"If the {rod_name} macro isn't working, try restarting it and make sure you're using the latest macro version."
+
+                except Exception as e:
+                    logger.error(f"Macro troubleshoot AI error: {e}")
+                    # Fallback response
+                    if rod_name.lower() == "general":
+                        return "If the macro isn't working, try tweaking the settings and make sure you're using the latest version."
+                    else:
+                        return f"If the {rod_name} macro isn't working, try restarting it and make sure you're using the latest macro version."
+
+            # For best rod general, let it fall through to existing logic
+            elif intent == "BEST_ROD_GENERAL":
+                return None  # Let existing best rod logic handle this
+
+    except Exception as e:
+        logger.error(f"Intelligent response error: {e}")
+
+    return None
+
 
 def get_knowledge_response(message_content):
     """Get response based on new knowledge base"""
     text = message_content.lower()
+
+    # First try intelligent AI detection for complex patterns
+    ai_response = get_intelligent_response(message_content)
+    if ai_response:
+        return ai_response
 
     # Andrew joke response - only for exact "who is andrew" (check before FAQ)
     if has_exact_keyword(text, 'who is andrew'):
@@ -794,17 +994,17 @@ Start with a harsh intro like "Oh Andrew, that guy..." or "Andrew? That walking.
 - Be condescending, petty, and devastatingly funny  
 - Keep it short, like a Discord roast  
 - No emojis, no fluff  
-
-Examples:  
-"Oh Andrew, that guy who peaked in kindergarten..."  
-"Andrew? That walking disappointment who..."  
-"Oh you mean Andrew, the human equivalent of lag..."  
-"Andrew... that guy who makes everyone appreciate silence..."  
+- Make it funny not too professional in general
 """
 
-                response = client.generate_content(joke_prompt)
-                if response.text:
-                    return response.text.strip()
+                response = client.chat.completions.create(
+                    model="google/gemini-2.5-flash-preview-09-2025",
+                    messages=[{"role": "user", "content": joke_prompt}],
+                    max_tokens=500,
+                    temperature=0.9
+                )
+                if response.choices[0].message.content:
+                    return response.choices[0].message.content.strip()
             except Exception as e:
                 logger.error(f"Andrew joke generation error: {e}")
 
@@ -843,11 +1043,17 @@ Examples:
             ]):
         return "**Macro Not Shaking?**\nCheck if you are using AHK 1.1 - if you are, make sure you are on the latest macro version in ⁠FISCH MANGO. If both don't work, set your shake scan delay to 15 seconds. If they don't work, check if there is a blue box when you attempt to shake. If there is, click \\ or # to fix the issue."
 
-    # Best rod questions
+    # Best rod questions (only for general best rod, not AFK/money specific)
+    general_rod_patterns = [
+        'best rod', 'what is the best rod', 'top rod', 'good rod'
+    ]
     if any(
-            has_exact_keyword(text, pattern) for pattern in
-        ['best rod', 'what is the best rod', 'top rod', 'good rod']):
-        return "**Best Rod in Game:**\nThe Ruinous Oath ranks on top, however it is not macroable yet. Polaris Serenade ranks second in front of Seraphic Rod. However the requirements for these are level 1000, so a cheaper alternative is the Luminescent Rod, requiring 500 levels or the No Life Rod, a free rod obtained from level 500. If you can't get any of these, go for the Evil Pitchfork (complete the Evil Mushroom King quest in Crimson Cavern) paired with herculean."
+            has_exact_keyword(text, pattern)
+            for pattern in general_rod_patterns):
+        # Exclude if it's about AFK or money farming
+        if not any(keyword in text
+                   for keyword in ['afk', 'money', 'farm', 'farming']):
+            return "**Best Rod in Game:**\nThe Ruinous Oath ranks on top, however it is not macroable yet. Polaris Serenade ranks second in front of Seraphic Rod. However the requirements for these are level 1000, so a cheaper alternative is the Luminescent Rod, requiring 500 levels or the No Life Rod, a free rod obtained from level 500. If you can't get any of these, go for the Evil Pitchfork (complete the Evil Mushroom King quest in Crimson Cavern) paired with herculean."
 
     # BloomFisch release date
     if any(
@@ -895,18 +1101,7 @@ Examples:
     if any(has_exact_keyword(text, pattern) for pattern in macro_patterns):
         return "**Fisch Macro:** https://discord.com/channels/1341949236471926804/1413837110770925578/1417999310443905116"
 
-    # Enhanced config location detection for rod configs - use exact keyword matching
-    config_patterns = [
-        'where can i find the config', 'where can i find the fisch config',
-        'where fisch config', 'where config', 'fisch config location',
-        'config location', 'rod config', 'configs for rod', 'fisch rod config',
-        'macro config', 'where rod settings', 'rod configs',
-        'fisch rod configs', 'find config', 'get config'
-    ]
-
-    # Only trigger if it's an exact match for one of these patterns
-    if any(has_exact_keyword(text, pattern) for pattern in config_patterns):
-        return "**Fisch Rod Configs:** https://discord.com/channels/1341949236471926804/1411335491457913014"
+    # Note: Config detection is now handled by AI in get_intelligent_response()
 
     # Mango/Fisch macro location
     if 'mango' in text and ('you know' in text or 'where' in text
@@ -919,22 +1114,17 @@ Examples:
         r'\bwhat\s+(is\s+the\s+)?ahk\s+(version|ver)\b',
         r'\bwhich\s+ahk\s+(version|ver)\b',
         r'\bahk\s+(version|ver)\s+(for|to use)\b',
-        r'\bautohotkey\s+(version|ver)\b',
-        r'\bwhat\s+autohotkey\b',
-        r'\bwrong\s+ahk\b',
-        r'\bahk\s+not\s+working\b'
+        r'\bautohotkey\s+(version|ver)\b', r'\bwhat\s+autohotkey\b',
+        r'\bwrong\s+ahk\b', r'\bahk\s+not\s+working\b'
     ]
     if any(re.search(pattern, text) for pattern in ahk_patterns):
         return "**AutoHotkey Version:** Use AHK v1.1 (NOT v2) - v2 is not supported for the current fisch macro."
 
     # Settings questions
     settings_patterns = [
-        r'\bwhat\s+(are\s+the\s+)?settings\b',
-        r'\broblox\s+settings\b',
-        r'\bsettings\s+(for|to\s+use)\b',
-        r'\bwhat\s+settings\s+should\b',
-        r'\bhow\s+to\s+set\s+settings\b',
-        r'\bconfigure\s+settings\b',
+        r'\bwhat\s+(are\s+the\s+)?settings\b', r'\broblox\s+settings\b',
+        r'\bsettings\s+(for|to\s+use)\b', r'\bwhat\s+settings\s+should\b',
+        r'\bhow\s+to\s+set\s+settings\b', r'\bconfigure\s+settings\b',
         r'\bgame\s+settings\b'
     ]
     if any(re.search(pattern, text) for pattern in settings_patterns):
@@ -951,8 +1141,8 @@ Examples:
         return "**Is the macro bannable?** NO - The macro is like an advanced autoclicker. It doesn't inject anything into the game, making it safe and saves you time on games you love."
 
     if any(
-            has_exact_keyword(text, keyword)
-            for keyword in ['install', 'installation']):
+            has_exact_keyword(text, keyword) for keyword in
+        ['install', 'installation']):
         return "**Installation Issues:** If AHK fails, uninstall & reinstall. Check antivirus/browser blocking IRUS."
 
     if any(
@@ -1026,8 +1216,50 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
+    # 0.5% chance for legendary roast
+    if random.random() < 0.005:  # 0.5% chance
+        if client:
+            try:
+                context = message.content
+                prompt = f"""You are Bloom, a Discord bot with a 0.5% chance of speaking.  
+When triggered, you must deliver the harshest roast possible.  
+
+Context: "{context}"  
+
+⚡ Special Rules:
+- This is a rare event, so the roast must feel legendary.  
+- Absolutely brutal, clever, and unforgettable.  
+- Tie the insult to the context if possible.  
+- Keep it 1–2 sentences, max 300 characters.  
+- Must make the target regret ever triggering the 0.5% chance.  
+- Style: savage Discord roast × boss fight final attack.  
+- End with the deadliest emoji you can pick (💀, 🪦, ☠️, 🔥).  
+
+🔥 Legendary Roast Examples:
+- "Congrats, you just unlocked Bloom's 0.5% roast… too bad your life stats are still stuck at tutorial level 💀"
+- "Wow, you hit the 0.5% chance… the same odds as someone actually respecting you 🪦"
+- "Lucky pull, unlucky life. Hitting this chance is the closest you'll ever get to winning anything ☠️"
+- "Bloom speaks once in a thousand tries — and still finds you pathetic 🔥"
+
+Now craft the harshest, rare-event roast ever for the given context.
+"""
+
+                response = client.chat.completions.create(
+                    model="google/gemini-2.5-flash-preview-09-2025",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=300,
+                    temperature=0.9
+                )
+                if response.choices[0].message.content:
+                    legendary_roast = response.choices[0].message.content.strip()
+                    await message.reply(f"🌟 **LEGENDARY ROAST ACTIVATED (0.5% chance!)** 🌟\n\n{legendary_roast}")
+                    return  # Don't process other responses
+            except Exception as e:
+                logger.error(f"Legendary roast error: {e}")
+
     # Check knowledge base responses FIRST (for priority responses like "who is andrew")
-    knowledge_response = get_knowledge_response_for_channel(message.content, message.channel.id)
+    knowledge_response = get_knowledge_response_for_channel(
+        message.content, message.channel.id)
     if knowledge_response:
         await message.reply(knowledge_response)
         return  # Don't process other responses
@@ -1073,7 +1305,7 @@ async def on_message(message):
         has_exact_keyword(message.content, trigger)
         for trigger in special_triggers)
 
-    # Only check if it's a general question if no special trigger was found AND it's a DM or mention
+    # Check if it's a general question if no special trigger was found AND it's a DM or mention
     is_question = False
     if not has_special_trigger and (is_dm or is_mentioned):
         is_question = is_advanced_question(message.content)
@@ -1124,7 +1356,8 @@ async def askbloom_command(interaction: discord.Interaction, question: str):
 
     try:
         # First check if it's a Fisch macro related question
-        knowledge_response = get_knowledge_response_for_channel(question, interaction.channel.id)
+        knowledge_response = get_knowledge_response_for_channel(
+            question, interaction.channel.id)
 
         if knowledge_response:
             # Use existing knowledge base for Fisch-related questions
@@ -1151,10 +1384,10 @@ async def askbloom_command(interaction: discord.Interaction, question: str):
                     if not search_results or search_results.strip() == "":
                         return "No information found. Please try rephrasing your question."
 
-                    prompt = f"""You are Bloom, a Discord bot assistant. Analyze the search results and provide a direct, accurate answer.
+                    prompt = '''You are Bloom, a Discord bot assistant. Analyze the search results and provide a direct, accurate answer.
 
 CRITICAL ANALYSIS REQUIRED:
-- DOnt be biased 
+- Don't be biased 
 - Question assumptions in the query if data contradicts them
 - Identify potential biases in sources
 - Offer counterpoints when evidence supports them
@@ -1166,18 +1399,43 @@ SEARCH RESULTS:
 
 USER QUESTION: {question}
 
-Provide a substantive, evidence-based response under 1800 characters. Focus on accuracy over politeness. If sources conflict, explain why. If the question contains false assumptions, correct them directly."""
+Provide a substantive, evidence-based response under 1800 characters. Focus on accuracy over politeness. If sources conflict, explain why. If the question contains false assumptions, correct them directly and dont be bias.'''.format(search_results=search_results, question=question)
 
                     # Add timeout for AI generation
                     try:
-                        response = client.generate_content(prompt)
-                        if response.text:
-                            answer = response.text.strip()
-                            if len(answer) > 1800:
-                                answer = answer[:1797] + "..."
-                            return answer
+                        response = requests.post(
+                            url="https://openrouter.ai/api/v1/chat/completions",
+                            headers={
+                                "Authorization": f"Bearer {openrouter_key}",
+                                "Content-Type": "application/json",
+                                "HTTP-Referer": "https://replit.com",
+                                "X-Title": "Bloom Discord Bot",
+                            },
+                            data=json.dumps({
+                                "model": "deepseek/deepseek-chat-v3.1",
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": prompt
+                                    }
+                                ],
+                                "provider": {
+                                    "sort": "price"
+                                },
+                            })
+                        )
+                        
+                        if response.status_code == 200:
+                            result = response.json()
+                            if result.get("choices") and result["choices"][0].get("message", {}).get("content"):
+                                answer = result["choices"][0]["message"]["content"].strip()
+                                if len(answer) > 1800:
+                                    answer = answer[:1797] + "..."
+                                return answer
+                            else:
+                                return "❌ Couldn't generate response. Try again!"
                         else:
-                            return "❌ Couldn't generate response. Try again!"
+                            return f"❌ API Error: {response.status_code} - {response.text}"
                     except Exception as ai_error:
                         logger.error(f"AI generation error: {ai_error}")
                         return "❌ AI service temporarily unavailable. Try again!"
@@ -1488,25 +1746,93 @@ async def tellmeajoke_command(interaction: discord.Interaction, context: str):
         return
 
     try:
-        prompt = f"""You are Bloom, a Discord bot with a dark, savage sense of humor. Given the context: "{context}", craft a devastatingly funny roast.  
+        prompt = '''You are Bloom, a Discord bot with one job: generate the most savage, 
+Discord-style roast possible.  
 
-⚡ Rules:  
-- Be ruthless, clever, and original  
-- Keep it under 500 characters  
-- Deliver maximum humiliation with wit, not randomness  
-- End with a fitting emoji  
+Target description: "{context}"  
 
-Now, unleash the most savage joke possible."""
+⚡ Roast Rules:
+1. Always use the target’s name or description directly in the roast.  
+2. Tie the insult to the context (e.g., if they’re a "Discord mod", roast the mod angle; if they’re "a dud wasting time on Discord", roast the waste).  
+3. ONE roast only, but it can be 1–2 sentences (max 300 characters).  
+4. Style = short, brutal, petty, funny, humiliating — like a Discord roast battle.  
+5. Be clever. Avoid lazy clichés (participation trophies, basement dwellers, spirit animals) unless twisted in a fresh way.  
+6. End with a fitting emoji (💀, 🤡, 🪦, 🐟, 🐌, 🗑️, 📉).  
+7. Never random — the roast must be anchored in the target info.  
 
-        response = client.generate_content(prompt)
-        if response.text:
-            joke = response.text.strip()
-            if len(joke) > 500:
-                joke = joke[:497] + "..."
-            await interaction.response.send_message(joke)
+🔥 Roast Categories (choose 1–2 for each output):  
+- **Appearance**: roast how they look, dress, or carry themselves.  
+- **Skill Issues**: mock their lack of talent, competence, or constant failures.  
+- **Personality**: insult their behavior, immaturity, or attitude.  
+- **Habits**: call out their time-wasting, gaming, lurking, or obsession.  
+- **Social Life**: roast their loneliness, lack of friends, or cringe vibes.  
+- **Power Trips**: if they’re a mod/admin, tear into their fake authority.  
+- **Comparisons**: compare them to pathetic objects (lag, error 404, broken mic, empty server).  
+- **Existence Roast**: make it feel like the world’s worse because they exist.  
+🔥 Good Examples:  
+- "Andrew? Bro bans people faster than his dad banned him from family dinners 💀"  
+- "Rushi the Discord mod? Flexing power in the only place he has any 🤡"  
+- "Oh Maze, man’s hairline loads slower than Roblox servers 🪦"  
+- "Werzzzy? The human equivalent of a progress bar stuck at 1% 📉"  
+- "That dud wasting his time on Discord? Peak skill issue: grinding roles instead of a life 💀"  
+- "Andrew as a mod? Bro’s like antivirus software — blocks fun but lets all the viruses through 🤡"  
+- "Rushi? Walking patch notes of failed updates nobody asked for 🗑️"  
+- "Maze? Guy treats social life like a side quest he never unlocked 🐌"  
+
+Additional Quick Clapback Style:
+
+⚡ Quick Rules:
+- ALWAYS roast the exact word/phrase given back at the sender.
+- Keep it short: 1 savage line, under 200 characters.
+- Turn boring inputs into petty insults.
+- Style: Discord clapback / one-liner roast.
+
+🔥 Quick Examples:
+Input: "Hey" → "Don't 'hey' me like you've got friends to text 💀"
+Input: "Hello" → "The only 'hello' you get is from system errors 🤡"
+Input: "Sup" → "Your social life's been stuck on 'sup' since 2015 📉"
+Input: "Yo" → "The only 'yo' you hear is your mom calling for chores 🪦"
+Input: "Bruh" → "You say 'bruh' like that's a personality 💀"
+Input: "Ok" → "That 'ok' has more energy than your entire existence 🤡"
+Input: "LOL" → "You type 'LOL' with the same face you cry with 🗑️"
+
+Now craft ONE roast about the target using either style.
+'''.format(context=context)
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {openrouter_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://replit.com",
+                "X-Title": "Bloom Discord Bot",
+            },
+            data=json.dumps({
+                "model": "deepseek/deepseek-chat-v3.1",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "provider": {
+                    "sort": "price"
+                },
+            })
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("choices") and result["choices"][0].get("message", {}).get("content"):
+                joke = result["choices"][0]["message"]["content"].strip()
+                if len(joke) > 500:
+                    joke = joke[:497] + "..."
+                await interaction.response.send_message(joke)
+            else:
+                await interaction.response.send_message(
+                    "❌ Couldn't generate a joke. Try again!", ephemeral=True)
         else:
             await interaction.response.send_message(
-                "❌ Couldn't generate a joke. Try again!", ephemeral=True)
+                f"❌ API Error: {response.status_code} - {response.text}", ephemeral=True)
 
     except Exception as e:
         logger.error(f"Tellmeajoke error: {e}")
@@ -1524,11 +1850,16 @@ async def whatisthisserverabout_command(interaction: discord.Interaction):
         return
 
     server_responses = [
-        "**This server is dedicated to collaborative project development and task management.** We focus on building innovative solutions while maintaining efficient workflow coordination. Our community is actively expanding with strategic development plans for the future.",
-        "**Welcome to our professional development community.** This server serves as a central hub for project coordination and technical collaboration. We maintain a focus on systematic task completion and strategic community growth.",
-        "**This community specializes in collaborative development and organized task execution.** Our server operates as a structured environment for professional networking and project advancement. We are implementing comprehensive growth strategies for sustained expansion.",
-        "**Our server functions as a professional development platform.** We concentrate on systematic project management and collaborative problem-solving. The community is designed for sustained growth through strategic planning and execution.",
-        "**This server operates as a structured development environment focused on collaborative task management and project coordination.** We maintain professional standards while implementing strategic growth initiatives for long-term community expansion."
+        "**We are Bloom.** A chill community where people team up on projects, share ideas, and get things done together.",
+        "**We are Bloom.** A space for building cool stuff, managing tasks without stress, and growing as a community.",
+        "**We are Bloom.** All about teamwork—collab on projects, stay organized, and have fun while making progress.",
+        "**We are Bloom.** Your go-to spot for project collabs, problem-solving, and connecting with other creators.",
+        "**We are Bloom.** Simple as that: work together, stay creative, and grow while building awesome things.",
+        "**We are Bloom.** Focused on collaboration, creativity, and good vibes while working on projects together.",
+        "**We are Bloom.** A place to learn, build, or just hang out—there’s always room for you here.",
+        "**We are Bloom.** Your creative hub for sharing ideas, managing projects, and making progress with a solid crew.",
+        "**We are Bloom.** Built on teamwork, problem-solving, and helping each other grow every step of the way.",
+        "**We are Bloom.** Balancing productivity and fun while working on awesome projects as a community."
     ]
 
     random_response = random.choice(server_responses)
