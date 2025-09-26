@@ -6,6 +6,9 @@ from datetime import datetime, timedelta
 import re
 import difflib
 import concurrent.futures
+import sqlite3
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Mock audioop module before importing discord to prevent ModuleNotFoundError
 sys.modules['audioop'] = MagicMock()
@@ -17,6 +20,7 @@ import asyncio
 import logging
 import random
 import requests
+import threading
 try:
     import trafilatura
 except ImportError:
@@ -79,6 +83,18 @@ TELLMEAJOKE_ROLE_ID = 1234567890123456789  # Replace with actual role ID
 # Moderation log channel (channel ID from provided URL)
 MOD_LOG_CHANNEL_ID = 1411335541873709167
 
+# Learning system configuration
+HELPER_ROLES = [
+    1418434355650625676,  # Teacher
+    1352853011424219158,  # Helper
+    1372300233240739920   # Junior Helper
+]
+LEARNING_CHANNEL_IDS = [
+    1411335494234669076,  # Original learning channel
+    1420020443082919966   # New learning channel
+]
+DB_FILE = "bloom_kb.db"
+
 discord_token = os.getenv('TOKEN')
 openrouter_key = os.getenv('API')  # DO NOT REMOVE - OpenRouter API key
 news_api_key = os.getenv('NEWS_API_KEY')  # Get from newsapi.org
@@ -114,8 +130,259 @@ if not openrouter_key:
 
 client = None
 if openrouter_key:
-    client = "requests_client"  # Flag to use requests instead
-    logger.info("✅ OpenRouter client initialized")
+    try:
+        from openai import OpenAI
+        # Clear any potential proxy configuration
+        import os
+        os.environ.pop('HTTP_PROXY', None)
+        os.environ.pop('HTTPS_PROXY', None)
+        os.environ.pop('http_proxy', None)
+        os.environ.pop('https_proxy', None)
+        
+        client = OpenAI(
+            api_key=openrouter_key,
+            base_url="https://openrouter.ai/api/v1"
+        )
+        logger.info("✅ OpenRouter client initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize OpenAI client: {e}")
+        logger.error(f"OpenRouter key length: {len(openrouter_key) if openrouter_key else 0}")
+        
+        # Try alternative initialization
+        try:
+            import httpx
+            http_client = httpx.Client()
+            client = OpenAI(
+                api_key=openrouter_key,
+                base_url="https://openrouter.ai/api/v1",
+                http_client=http_client
+            )
+            logger.info("✅ OpenRouter client initialized with custom http client")
+        except Exception as e2:
+            logger.error(f"Alternative initialization also failed: {e2}")
+            client = None
+
+# -----------------------------
+# Personality Prompt
+# -----------------------------
+BLOOM_PERSONALITY = """
+You are Bloom, a Discord AI assistant.
+
+Personality Rules:
+- Focus on substance over praise.
+- Skip unnecessary compliments.
+- Engage critically: question assumptions, identify biases, and give counterpoints.
+- Don't shy away from disagreement when warranted.
+- Agreement must always be reasoned and evidence-based.
+- When teaching (math, coding, etc.), explain step by step.
+- Be conversational, not stiff, but avoid fluff.
+"""
+
+# -----------------------------
+# Conversation Memory
+# -----------------------------
+user_context = {}  # user_id -> [{"q":..., "a":...}, ...]
+
+def add_to_context(user_id, question, answer):
+    history = user_context.get(user_id, [])
+    history.append({"q": question, "a": answer})
+    user_context[user_id] = history[-5:]  # keep last 5 turns
+
+def get_user_history(user_id):
+    history = user_context.get(user_id, [])
+    return "\n".join([f"Q: {h['q']}\nA: {h['a']}" for h in history])
+
+
+# -----------------------------
+# Learning System Functions
+# -----------------------------
+def init_db():
+    """Initialize the knowledge base database"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS qa_pairs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question TEXT,
+            answer TEXT,
+            helper_id TEXT,
+            channel_id TEXT,
+            timestamp TEXT,
+            embedding BLOB
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info("✅ Knowledge base database initialized")
+
+def get_embedding(text: str):
+    """Fetch embedding from OpenRouter embedding model"""
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/embeddings",
+            headers={"Authorization": f"Bearer {openrouter_key}",
+                     "Content-Type": "application/json"},
+            json={"model": "text-embedding-3-large", "input": text}
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data["data"][0]["embedding"]
+    except Exception as e:
+        logger.error(f"Failed to get embedding: {e}")
+    return None
+
+def save_qa(question: str, answer: str, helper_id: int, channel_id: int):
+    """Save a question-answer pair to the knowledge base"""
+    # Skip duplicates
+    if find_similar(question, min_threshold=0.9):
+        logger.info(f"Skipping duplicate question: {question[:50]}...")
+        return
+
+    emb = get_embedding(question)
+    if not emb:
+        logger.error(f"Failed to get embedding for question: {question[:50]}...")
+        return
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO qa_pairs (question, answer, helper_id, channel_id, timestamp, embedding) VALUES (?, ?, ?, ?, ?, ?)",
+              (question, answer, str(helper_id), str(channel_id), datetime.now().isoformat(), json.dumps(emb)))
+    conn.commit()
+    conn.close()
+    logger.info(f"💾 Learned: {question[:50]}... -> {answer[:50]}...")
+
+def find_similar(query: str, top_n=1, min_threshold=0.65):
+    """Find similar questions in the knowledge base"""
+    emb = get_embedding(query)
+    if not emb:
+        return []
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT question, answer, embedding FROM qa_pairs")
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        return []
+
+    # Convert embeddings
+    try:
+        stored_embs = [np.array(json.loads(row[2])) for row in rows]
+        query_emb = np.array(emb).reshape(1, -1)
+        sims = cosine_similarity(query_emb, np.vstack(stored_embs))[0]
+
+        scored = list(zip(rows, sims))
+        scored = sorted(scored, key=lambda x: x[1], reverse=True)
+
+        # Filter by confidence threshold
+        filtered = [(q, a, score) for (q, a, _), score in scored if score >= min_threshold]
+        return filtered[:top_n]
+    except Exception as e:
+        logger.error(f"Error in similarity search: {e}")
+        return []
+
+def ask_ai(question: str) -> str:
+    """Ask the AI for a response using OpenRouter"""
+    try:
+        prompt = f"""{BLOOM_PERSONALITY}
+
+User Question: {question}
+
+Answer according to personality rules."""
+        
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {openrouter_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://replit.com",
+                "X-Title": "Bloom Discord Bot",
+            },
+            json={
+                "model": "deepseek/deepseek-chat-v3.1",
+                "messages": [{"role": "user", "content": prompt}],
+                "provider": {"sort": "price"},
+            },
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result["choices"][0]["message"]["content"].strip()
+        else:
+            logger.error(f"AI request failed: {response.status_code}")
+            return "Sorry, I'm having trouble thinking right now. Try again later."
+    except Exception as e:
+        logger.error(f"Error in ask_ai: {e}")
+        return "Sorry, I encountered an error. Please try again."
+
+
+# -----------------------------
+# Query Normalizer
+# -----------------------------
+def normalize_query(q: str) -> str:
+    q_lower = q.strip().lower()
+
+    if q_lower in ["clashroyale", "clash royale"]:
+        return "Clash Royale mobile game Supercell"
+    if q_lower in ["genshin", "genshin impact"]:
+        return "Genshin Impact video game miHoYo"
+    if q_lower in ["roblox"]:
+        return "Roblox online platform game"
+
+    return q
+
+
+# -----------------------------
+# Weather Helper
+# -----------------------------
+def get_weather(location: str) -> str:
+    try:
+        resp = requests.get(f"https://wttr.in/{location}?format=3", timeout=5)
+        if resp.status_code == 200:
+            return f"🌦️ {resp.text}"
+    except Exception:
+        pass
+    return None
+
+
+# -----------------------------
+# Improved Search
+# -----------------------------
+def improved_multi_source_search(query: str) -> str:
+    query = normalize_query(query)
+    raw_results = multi_source_search(query)
+
+    # Relevance filter: only keep results that mention query tokens
+    results = []
+    q_tokens = query.lower().split()
+    for line in raw_results.split("\n"):
+        if any(token in line.lower() for token in q_tokens):
+            results.append(line)
+
+    return "\n".join(results) if results else raw_results
+
+
+# -----------------------------
+# Intent Detection
+# -----------------------------
+def detect_intent(q: str) -> str:
+    q_lower = q.lower()
+
+    # News / current events
+    if any(w in q_lower for w in ["news", "latest", "update", "today", "breaking"]):
+        return "NEWS"
+    # Weather
+    if any(w in q_lower for w in ["weather", "temperature", "forecast"]):
+        return "WEATHER"
+    # Math
+    if any(sym in q_lower for sym in ["+", "-", "*", "/", "solve", "equation", "integral", "derivative"]):
+        return "MATH"
+    # Code
+    if any(w in q_lower for w in ["python", "code", "function", "script", "java", "c++", "ahk", "autohotkey", "rust", "c#", "lua"]):
+        return "CODE"
+    # Otherwise general chat / joke / philosophy
+    return "CHAT"
 
 # -----------------------------
 # Bot setup
@@ -698,6 +965,9 @@ def is_disallowed_context(text: str) -> bool:
 load_faq()
 
 
+# Duplicate learning functions removed - using the ones at line 215-282
+
+
 # -----------------------------
 # Global Helper Functions
 # -----------------------------
@@ -723,15 +993,10 @@ def has_exact_keyword(text_to_check, keyword):
 # -----------------------------
 def get_knowledge_response_for_channel(message_content, channel_id):
     """Get response based on knowledge base with channel restrictions"""
-    # Allowed channel IDs for keyword responses
+    # Allowed channel IDs for keyword responses - only the two specified channels
     ALLOWED_CHANNELS = [
-        1411335434721820703,  # First channel
-        1409580331735974009,  # Second channel from the URL
-        1411335492875583578,  # Additional channel 1
-        1411335494234669076,  # Additional channel 2
-        1411335495941619733,  # Additional channel 3
-        1411335497699033088,  # Additional channel 4
-        1411335498945003654  # Additional channel 5
+        1409580331735974009,  # First specified channel
+        1411335494234669076   # Second specified channel
     ]
 
     # If not in allowed channels, only allow special responses (Andrew, Rushi, etc.)
@@ -762,14 +1027,25 @@ Examples:
 "Andrew... that guy who makes everyone appreciate silence..."  
 """
 
-                    response = client.chat.completions.create(
-                        model="google/gemini-2.5-flash-preview-09-2025",
-                        messages=[{"role": "user", "content": joke_prompt}],
-                        max_tokens=500,
-                        temperature=0.9
+                    response = requests.post(
+                        url="https://openrouter.ai/api/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {openrouter_key}",
+                            "Content-Type": "application/json",
+                            "HTTP-Referer": "https://replit.com",
+                            "X-Title": "Bloom Discord Bot",
+                        },
+                        data=json.dumps({
+                            "model": "deepseek/deepseek-chat-v3.1",
+                            "messages": [{"role": "user", "content": joke_prompt}],
+                            "provider": {"sort": "price"},
+                        }),
                     )
-                    if response.choices[0].message.content:
-                        return response.choices[0].message.content.strip()
+
+                    if response.status_code == 200:
+                        result = response.json()
+                        if result.get("choices") and result["choices"][0].get("message", {}).get("content"):
+                            return result["choices"][0]["message"]["content"].strip()
                 except Exception as e:
                     logger.error(f"Andrew joke generation error: {e}")
 
@@ -838,14 +1114,26 @@ Examples:
 - "what enchant should I use on rotd" → NO_MATCH
 - "lucky vs control enchant" → NO_MATCH"""
 
-        response = client.chat.completions.create(
-            model="google/gemini-2.5-flash-preview-09-2025",
-            messages=[{"role": "user", "content": intent_prompt}],
-            max_tokens=100,
-            temperature=0.3
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {openrouter_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://replit.com",
+                "X-Title": "Bloom Discord Bot",
+            },
+            data=json.dumps({
+                "model": "google/gemini-2.5-flash-preview-09-2025",
+                "messages": [{"role": "user", "content": intent_prompt}],
+                "max_tokens": 100,
+                "temperature": 0.3,
+                "provider": {"sort": "price"},
+            }),
         )
-        if response.choices[0].message.content:
-            intent = response.choices[0].message.content.strip()
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("choices") and result["choices"][0].get("message", {}).get("content"):
+                intent = result["choices"][0]["message"]["content"].strip()
 
             # Handle AFK money rod questions
             if intent == "AFK_MONEY_ROD":
@@ -935,14 +1223,26 @@ User is having macro issues with {rod_name} rod. Suggest:
 
 Keep it under 100 characters and casual/friendly tone. DO NOT mention configs or settings files."""
 
-                    response = client.chat.completions.create(
-                        model="google/gemini-2.5-flash-preview-09-2025",
-                        messages=[{"role": "user", "content": troubleshoot_prompt}],
-                        max_tokens=200,
-                        temperature=0.7
+                    response = requests.post(
+                        url="https://openrouter.ai/api/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {openrouter_key}",
+                            "Content-Type": "application/json",
+                            "HTTP-Referer": "https://replit.com",
+                            "X-Title": "Bloom Discord Bot",
+                        },
+                        data=json.dumps({
+                            "model": "google/gemini-2.5-flash-preview-09-2025",
+                            "messages": [{"role": "user", "content": troubleshoot_prompt}],
+                            "max_tokens": 200,
+                            "temperature": 0.7,
+                            "provider": {"sort": "price"},
+                        }),
                     )
-                    if response.choices[0].message.content:
-                        return response.choices[0].message.content.strip()
+                    if response.status_code == 200:
+                        result = response.json()
+                        if result.get("choices") and result["choices"][0].get("message", {}).get("content"):
+                            return result["choices"][0]["message"]["content"].strip()
                     else:
                         # Fallback response
                         if rod_name.lower() == "general":
@@ -997,14 +1297,25 @@ Start with a harsh intro like "Oh Andrew, that guy..." or "Andrew? That walking.
 - Make it funny not too professional in general
 """
 
-                response = client.chat.completions.create(
-                    model="google/gemini-2.5-flash-preview-09-2025",
-                    messages=[{"role": "user", "content": joke_prompt}],
-                    max_tokens=500,
-                    temperature=0.9
+                response = requests.post(
+                    url="https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {openrouter_key}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://replit.com",
+                        "X-Title": "Bloom Discord Bot",
+                    },
+                    data=json.dumps({
+                        "model": "deepseek/deepseek-chat-v3.1",
+                        "messages": [{"role": "user", "content": joke_prompt}],
+                        "provider": {"sort": "price"},
+                    }),
                 )
-                if response.choices[0].message.content:
-                    return response.choices[0].message.content.strip()
+
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get("choices") and result["choices"][0].get("message", {}).get("content"):
+                        return result["choices"][0]["message"]["content"].strip()
             except Exception as e:
                 logger.error(f"Andrew joke generation error: {e}")
 
@@ -1143,7 +1454,7 @@ Start with a harsh intro like "Oh Andrew, that guy..." or "Andrew? That walking.
     if any(
             has_exact_keyword(text, keyword) for keyword in
         ['install', 'installation']):
-        return "**Installation Issues:** If AHK fails, uninstall & reinstall. Check antivirus/browser blocking IRUS."
+        return "**Installation Issues:** If AHK fails to install, try uninstalling it completely and reinstalling. Check if your antivirus software is blocking the installation - some antivirus programs flag AutoHotkey as suspicious. You may need to temporarily disable real-time protection or add an exception for AHK."
 
     if any(
             has_exact_keyword(text, keyword) for keyword in
@@ -1213,108 +1524,66 @@ async def on_member_update(before, after):
 
 @bot.event
 async def on_message(message):
-    if message.author == bot.user:
+    if message.author.bot:
         return
 
-    # 0.5% chance for legendary roast
-    if random.random() < 0.005:  # 0.5% chance
-        if client:
-            try:
-                context = message.content
-                prompt = f"""You are Bloom, a Discord bot with a 0.5% chance of speaking.  
-When triggered, you must deliver the harshest roast possible.  
+    # Check for keyword responses and knowledge base in ALL channels
+    if not message.content.startswith('!') and not message.content.startswith('/'):
+        # Check for keyword responses first
+        for keyword_name, keyword_data in keywords_data.items():
+            if has_exact_keyword(message.content, keyword_data['detection_text']):
+                response_parts = []
+                if keyword_data['response_text']:
+                    response_parts.append(keyword_data['response_text'])
+                if keyword_data['img']:
+                    response_parts.append(keyword_data['img'])
+                if keyword_data['link']:
+                    response_parts.append(keyword_data['link'])
+                
+                if response_parts:
+                    await message.channel.send('\n'.join(response_parts))
+                    await bot.process_commands(message)
+                    return
 
-Context: "{context}"  
+        # Check knowledge base responses for all channels
+        kb_response = get_knowledge_response_for_channel(message.content, message.channel.id)
+        if kb_response:
+            await message.channel.send(kb_response)
+            await bot.process_commands(message)
+            return
 
-⚡ Special Rules:
-- This is a rare event, so the roast must feel legendary.  
-- Absolutely brutal, clever, and unforgettable.  
-- Tie the insult to the context if possible.  
-- Keep it 1–2 sentences, max 300 characters.  
-- Must make the target regret ever triggering the 0.5% chance.  
-- Style: savage Discord roast × boss fight final attack.  
-- End with the deadliest emoji you can pick (💀, 🪦, ☠️, 🔥).  
+        # Check if it's an advanced question for general AI response
+        if is_advanced_question(message.content):
+            # Only respond with AI in learning channels to avoid spam
+            if message.channel.id in LEARNING_CHANNEL_IDS:
+                ai_response = ask_ai(message.content.strip())
+                await message.channel.send(ai_response)
+                await bot.process_commands(message)
+                return
 
-🔥 Legendary Roast Examples:
-- "Congrats, you just unlocked Bloom's 0.5% roast… too bad your life stats are still stuck at tutorial level 💀"
-- "Wow, you hit the 0.5% chance… the same odds as someone actually respecting you 🪦"
-- "Lucky pull, unlucky life. Hitting this chance is the closest you'll ever get to winning anything ☠️"
-- "Bloom speaks once in a thousand tries — and still finds you pathetic 🔥"
-
-Now craft the harshest, rare-event roast ever for the given context.
-"""
-
-                response = client.chat.completions.create(
-                    model="google/gemini-2.5-flash-preview-09-2025",
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=300,
-                    temperature=0.9
-                )
-                if response.choices[0].message.content:
-                    legendary_roast = response.choices[0].message.content.strip()
-                    await message.reply(f"🌟 **LEGENDARY ROAST ACTIVATED (0.5% chance!)** 🌟\n\n{legendary_roast}")
-                    return  # Don't process other responses
-            except Exception as e:
-                logger.error(f"Legendary roast error: {e}")
-
-    # Check knowledge base responses FIRST (for priority responses like "who is andrew")
-    knowledge_response = get_knowledge_response_for_channel(
-        message.content, message.channel.id)
-    if knowledge_response:
-        await message.reply(knowledge_response)
-        return  # Don't process other responses
-
-    # Then check for exact keyword matches
-    message_text = message.content.strip()
-
-    for keyword_name, keyword_data in keywords_data.items():
-        detection_text = keyword_data['detection_text']
-
-        # Check for EXACT match (case-insensitive)
-        if message_text.casefold() == detection_text.casefold():
-            response_parts = []
-
-            # Add response text if available
-            if keyword_data['response_text']:
-                response_parts.append(keyword_data['response_text'])
-
-            # Add image if available
-            if keyword_data['img']:
-                response_parts.append(keyword_data['img'])
-
-            # Add link if available
-            if keyword_data['link']:
-                response_parts.append(keyword_data['link'])
-
-            # Send response if we have anything to send
-            if response_parts:
-                await message.reply('\n'.join(response_parts))
-                return  # Don't process other responses
-
-    # Respond to DMs or mentions
-    is_dm = isinstance(message.channel, discord.DMChannel)
-    is_mentioned = bot.user in message.mentions
-
-    # Special responses that don't need question indicators
-    special_triggers = [
-        'who is andrew', 'who is rushi', 'who is werzzzy', 'how to read'
-    ]
-
-    # Check for special triggers FIRST
-    has_special_trigger = any(
-        has_exact_keyword(message.content, trigger)
-        for trigger in special_triggers)
-
-    # Check if it's a general question if no special trigger was found AND it's a DM or mention
-    is_question = False
-    if not has_special_trigger and (is_dm or is_mentioned):
-        is_question = is_advanced_question(message.content)
-
-    # Respond if it's a DM, mention, has special trigger, or is a question
-    if is_dm or is_mentioned or has_special_trigger or is_question:
-        response = get_knowledge_response(message.content)
-        if response:
-            await message.reply(response)
+    # Learning system (restricted to learning channels only)
+    if message.channel.id in LEARNING_CHANNEL_IDS:
+        # If helper replies → save Q&A
+        if hasattr(message.author, 'roles') and any(role.id in HELPER_ROLES for role in message.author.roles):
+            if message.reference and message.reference.message_id:
+                try:
+                    replied_to = await message.channel.fetch_message(message.reference.message_id)
+                    q = replied_to.content.strip()
+                    a = message.content.strip()
+                    if q and a:
+                        save_qa(q, a, message.author.id, message.channel.id)
+                except Exception as e:
+                    logger.error(f"Failed to process helper reply: {e}")
+        else:
+            # Normal user asks in learning channels → check KB first
+            matches = find_similar(message.content.strip())
+            if matches:
+                q, a, score = matches[0]
+                await message.channel.send(f"💡 {a}")
+            else:
+                # Fallback to AI if no KB match
+                ai_answer = ask_ai(message.content.strip())
+                await message.channel.send(ai_answer)
 
     await bot.process_commands(message)
 
@@ -1324,134 +1593,94 @@ Now craft the harshest, rare-event roast ever for the given context.
 # -----------------------------
 @bot.tree.command(
     name="askbloom",
-    description="Ask Bloom anything with web search for accurate info")
+    description="Ask Bloom anything (chat, math, code, news, weather)")
 @app_commands.describe(
-    question="Your question - I'll search the web for current information!")
+    question="Your question or message")
 async def askbloom_command(interaction: discord.Interaction, question: str):
-    # Check if user is authorized admin
     if not is_admin_user(interaction.user.id):
         await interaction.response.send_message(
             "❌ You don't have permission to use this command.", ephemeral=True)
         return
 
-    if not client:
-        await interaction.response.send_message("❌ AI service not available.",
-                                                ephemeral=True)
-        return
-
-    # Content filter
-    question_lower = question.lower()
-    banned_words = [
-        'racist', 'racism', 'nazi', 'hitler', 'slur', 'hate speech', 'nigger',
-        'faggot'
-    ]
-
-    if any(word in question_lower for word in banned_words):
-        await interaction.response.send_message(
-            "❌ I can't help with that. Ask something else!", ephemeral=True)
-        return
-
-    # Send initial response and defer for longer processing
     await interaction.response.defer()
 
     try:
-        # First check if it's a Fisch macro related question
-        knowledge_response = get_knowledge_response_for_channel(
-            question, interaction.channel.id)
+        user_id = interaction.user.id
+        intent = detect_intent(question)
+        results = None
 
-        if knowledge_response:
-            # Use existing knowledge base for Fisch-related questions
-            await interaction.followup.send(knowledge_response)
-        else:
-            # Add timeout wrapper for the entire search process
-            async def search_with_timeout():
+        # Mode routing
+        if intent == "NEWS":
+            results = improved_multi_source_search(question)
+        elif intent == "WEATHER":
+            location = question.replace("weather", "").replace("forecast", "").strip()
+            results = get_weather(location)
+        elif intent == "CHAT":
+            # Fallback to knowledge base first
+            kb_resp = get_knowledge_response_for_channel(question, interaction.channel.id)
+            if kb_resp:
+                add_to_context(user_id, question, kb_resp)
+                await interaction.followup.send(kb_resp)
+                return
+        # For MATH and CODE → no search, AI handles
+
+        # Wikipedia fallback - only for substantial questions, not greetings
+        if (not results or "I couldn't find" in str(results)) and wikipedia:
+            # Don't search Wikipedia for short greetings or conversational phrases
+            question_lower = question.lower().strip()
+            greetings = ["hi", "hello", "hey", "yo", "sup", "how are you", "how's it going", 
+                        "what's up", "whatsup", "good morning", "good evening", "good night"]
+            
+            if len(question.split()) >= 3 and not any(greeting in question_lower for greeting in greetings):
                 try:
-                    # Run search in a separate thread to avoid blocking
-                    import concurrent.futures
+                    wiki_summary = wikipedia.summary(question, sentences=2)
+                    results = f"📖 Wikipedia: {wiki_summary}"
+                except Exception:
+                    pass
 
-                    def run_search():
-                        return multi_source_search(question)
+        # Build full AI prompt
+        history = get_user_history(user_id)
+        prompt = f"""{BLOOM_PERSONALITY}
 
-                    # Use ThreadPoolExecutor with timeout
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(run_search)
-                        try:
-                            search_results = future.result(
-                                timeout=15)  # 15 second total timeout
-                        except concurrent.futures.TimeoutError:
-                            return "Search timed out. Please try a simpler question or try again later."
+Conversation so far:
+{history}
 
-                    if not search_results or search_results.strip() == "":
-                        return "No information found. Please try rephrasing your question."
+User Question: {question}
+Relevant Info: {results if results else "N/A"}
 
-                    prompt = '''You are Bloom, a Discord bot assistant. Analyze the search results and provide a direct, accurate answer.
+Answer according to personality rules.
+"""
 
-CRITICAL ANALYSIS REQUIRED:
-- Don't be biased 
-- Question assumptions in the query if data contradicts them
-- Identify potential biases in sources
-- Offer counterpoints when evidence supports them
-- Don't sugarcoat - be direct about facts even if uncomfortable
-- Challenge popular misconceptions with evidence
+        # Send to AI
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {openrouter_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://replit.com",
+                "X-Title": "Bloom Discord Bot",
+            },
+            data=json.dumps({
+                "model": "deepseek/deepseek-chat-v3.1",
+                "messages": [{"role": "user", "content": prompt}],
+                "provider": {"sort": "price"},
+            }),
+        )
 
-SEARCH RESULTS:
-{search_results}
+        if response.status_code == 200:
+            result = response.json()
+            answer = result["choices"][0]["message"]["content"].strip()
+            if len(answer) > 1800:
+                answer = answer[:1797] + "..."
+        else:
+            answer = f"❌ API Error: {response.status_code}"
 
-USER QUESTION: {question}
+        # Save to memory
+        add_to_context(user_id, question, answer)
 
-Provide a substantive, evidence-based response under 1800 characters. Focus on accuracy over politeness. If sources conflict, explain why. If the question contains false assumptions, correct them directly and dont be bias.'''.format(search_results=search_results, question=question)
+        # Send answer
+        await interaction.followup.send(answer)
 
-                    # Add timeout for AI generation
-                    try:
-                        response = requests.post(
-                            url="https://openrouter.ai/api/v1/chat/completions",
-                            headers={
-                                "Authorization": f"Bearer {openrouter_key}",
-                                "Content-Type": "application/json",
-                                "HTTP-Referer": "https://replit.com",
-                                "X-Title": "Bloom Discord Bot",
-                            },
-                            data=json.dumps({
-                                "model": "deepseek/deepseek-chat-v3.1",
-                                "messages": [
-                                    {
-                                        "role": "user",
-                                        "content": prompt
-                                    }
-                                ],
-                                "provider": {
-                                    "sort": "price"
-                                },
-                            })
-                        )
-                        
-                        if response.status_code == 200:
-                            result = response.json()
-                            if result.get("choices") and result["choices"][0].get("message", {}).get("content"):
-                                answer = result["choices"][0]["message"]["content"].strip()
-                                if len(answer) > 1800:
-                                    answer = answer[:1797] + "..."
-                                return answer
-                            else:
-                                return "❌ Couldn't generate response. Try again!"
-                        else:
-                            return f"❌ API Error: {response.status_code} - {response.text}"
-                    except Exception as ai_error:
-                        logger.error(f"AI generation error: {ai_error}")
-                        return "❌ AI service temporarily unavailable. Try again!"
-
-                except Exception as search_error:
-                    logger.error(f"Search error: {search_error}")
-                    return "❌ Search failed. Try a simpler question or try again later."
-
-            # Run the search with timeout
-            result = await search_with_timeout()
-            await interaction.followup.send(result)
-
-    except asyncio.TimeoutError:
-        logger.error("AskBloom timeout")
-        await interaction.followup.send(
-            "❌ Request timed out. Try a simpler question!")
     except Exception as e:
         logger.error(f"AskBloom error: {e}")
         await interaction.followup.send("❌ Something went wrong. Try again!")
@@ -1727,10 +1956,12 @@ async def tellmeajoke_command(interaction: discord.Interaction, context: str):
             "❌ You don't have permission to use this command.", ephemeral=True)
         return
 
-    if not client:
+    if not openrouter_key:
         await interaction.response.send_message("❌ AI service not available.",
                                                 ephemeral=True)
         return
+
+    await interaction.response.defer()
 
     # Content filter
     context_lower = context.lower()
@@ -1753,7 +1984,7 @@ Target description: "{context}"
 
 ⚡ Roast Rules:
 1. Always use the target’s name or description directly in the roast.  
-2. Tie the insult to the context (e.g., if they’re a "Discord mod", roast the mod angle; if they’re "a dud wasting time on Discord", roast the waste).  
+2. Tie the insult to the context if possible.  (e.g., if they’re a "Discord mod", roast the mod angle; if they’re "a dud wasting time on Discord", roast the waste).  
 3. ONE roast only, but it can be 1–2 sentences (max 300 characters).  
 4. Style = short, brutal, petty, funny, humiliating — like a Discord roast battle.  
 5. Be clever. Avoid lazy clichés (participation trophies, basement dwellers, spirit animals) unless twisted in a fresh way.  
@@ -1819,25 +2050,28 @@ Now craft ONE roast about the target using either style.
                 },
             })
         )
-        
+
         if response.status_code == 200:
             result = response.json()
             if result.get("choices") and result["choices"][0].get("message", {}).get("content"):
                 joke = result["choices"][0]["message"]["content"].strip()
                 if len(joke) > 500:
                     joke = joke[:497] + "..."
-                await interaction.response.send_message(joke)
+                await interaction.followup.send(joke)
             else:
-                await interaction.response.send_message(
-                    "❌ Couldn't generate a joke. Try again!", ephemeral=True)
+                await interaction.followup.send(
+                    "❌ Couldn't generate a joke. Try again!")
         else:
-            await interaction.response.send_message(
-                f"❌ API Error: {response.status_code} - {response.text}", ephemeral=True)
+            await interaction.followup.send(
+                f"❌ API Error: {response.status_code}")
 
     except Exception as e:
         logger.error(f"Tellmeajoke error: {e}")
-        await interaction.response.send_message(
-            "❌ Something went wrong. Try again!", ephemeral=True)
+        try:
+            await interaction.followup.send("❌ Something went wrong. Try again!")
+        except:
+            # If followup fails, the interaction might have already been handled
+            pass
 
 
 @bot.tree.command(name="whatisthisserverabout",
@@ -1997,6 +2231,12 @@ def start_bot(token=None):
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info("🌐 Flask server started on port 5000")
+
+    # Initialize learning system database
+    try:
+        init_db()
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
 
     logger.info("🤖 Starting Discord bot...")
 
