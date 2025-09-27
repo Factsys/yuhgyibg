@@ -299,11 +299,20 @@ Answer according to personality rules."""
                 "HTTP-Referer": "https://replit.com",
                 "X-Title": "Bloom Discord Bot",
             },
-            json={
-                "model": "deepseek/deepseek-chat-v3.1",
-                "messages": [{"role": "user", "content": prompt}],
-                "provider": {"sort": "price"},
-            },
+            data=json.dumps({
+                "model": "x-ai/grok-4-fast:free",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            }
+                        ]
+                    }
+                ],
+            })
         )
         
         if response.status_code == 200:
@@ -311,10 +320,10 @@ Answer according to personality rules."""
             return result["choices"][0]["message"]["content"].strip()
         else:
             logger.error(f"AI request failed: {response.status_code}")
-            return "Sorry, I'm having trouble thinking right now. Try again later."
+            return None  # Return None instead of error message to stay silent
     except Exception as e:
         logger.error(f"Error in ask_ai: {e}")
-        return "Sorry, I encountered an error. Please try again."
+        return None  # Return None instead of error message to stay silent
 
 
 # -----------------------------
@@ -1036,9 +1045,18 @@ Examples:
                             "X-Title": "Bloom Discord Bot",
                         },
                         data=json.dumps({
-                            "model": "deepseek/deepseek-chat-v3.1",
-                            "messages": [{"role": "user", "content": joke_prompt}],
-                            "provider": {"sort": "price"},
+                            "model": "x-ai/grok-4-fast:free",
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": joke_prompt
+                                        }
+                                    ]
+                                }
+                            ],
                         }),
                     )
 
@@ -1123,11 +1141,20 @@ Examples:
                 "X-Title": "Bloom Discord Bot",
             },
             data=json.dumps({
-                "model": "google/gemini-2.5-flash-preview-09-2025",
-                "messages": [{"role": "user", "content": intent_prompt}],
+                "model": "x-ai/grok-4-fast:free",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": intent_prompt
+                            }
+                        ]
+                    }
+                ],
                 "max_tokens": 100,
                 "temperature": 0.3,
-                "provider": {"sort": "price"},
             }),
         )
         if response.status_code == 200:
@@ -1232,11 +1259,20 @@ Keep it under 100 characters and casual/friendly tone. DO NOT mention configs or
                             "X-Title": "Bloom Discord Bot",
                         },
                         data=json.dumps({
-                            "model": "google/gemini-2.5-flash-preview-09-2025",
-                            "messages": [{"role": "user", "content": troubleshoot_prompt}],
+                            "model": "x-ai/grok-4-fast:free",
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": troubleshoot_prompt
+                                        }
+                                    ]
+                                }
+                            ],
                             "max_tokens": 200,
                             "temperature": 0.7,
-                            "provider": {"sort": "price"},
                         }),
                     )
                     if response.status_code == 200:
@@ -1557,7 +1593,8 @@ async def on_message(message):
             # Only respond with AI in learning channels to avoid spam
             if message.channel.id in LEARNING_CHANNEL_IDS:
                 ai_response = ask_ai(message.content.strip())
-                await message.channel.send(ai_response)
+                if ai_response:  # Only send if AI actually returned something
+                    await message.channel.send(ai_response)
                 await bot.process_commands(message)
                 return
 
@@ -1583,7 +1620,8 @@ async def on_message(message):
             else:
                 # Fallback to AI if no KB match
                 ai_answer = ask_ai(message.content.strip())
-                await message.channel.send(ai_answer)
+                if ai_answer:  # Only send if AI actually returned something
+                    await message.channel.send(ai_answer)
 
     await bot.process_commands(message)
 
@@ -1602,7 +1640,11 @@ async def askbloom_command(interaction: discord.Interaction, question: str):
             "❌ You don't have permission to use this command.", ephemeral=True)
         return
 
-    await interaction.response.defer()
+    try:
+        await interaction.response.defer()
+    except discord.errors.HTTPException:
+        # Interaction already acknowledged, use followup instead
+        pass
 
     try:
         user_id = interaction.user.id
@@ -1661,9 +1703,18 @@ Answer according to personality rules.
                 "X-Title": "Bloom Discord Bot",
             },
             data=json.dumps({
-                "model": "deepseek/deepseek-chat-v3.1",
-                "messages": [{"role": "user", "content": prompt}],
-                "provider": {"sort": "price"},
+                "model": "x-ai/grok-4-fast:free",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            }
+                        ]
+                    }
+                ],
             }),
         )
 
@@ -1672,8 +1723,12 @@ Answer according to personality rules.
             answer = result["choices"][0]["message"]["content"].strip()
             if len(answer) > 1800:
                 answer = answer[:1797] + "..."
+        elif response.status_code == 402:
+            answer = "❌ OpenRouter API payment required. Please check your OpenRouter account billing at https://openrouter.ai/account"
+        elif response.status_code == 429:
+            answer = "❌ Rate limited. Please try again in a moment."
         else:
-            answer = f"❌ API Error: {response.status_code}"
+            answer = f"❌ API Error: {response.status_code} - {response.text[:100]}"
 
         # Save to memory
         add_to_context(user_id, question, answer)
@@ -1961,7 +2016,11 @@ async def tellmeajoke_command(interaction: discord.Interaction, context: str):
                                                 ephemeral=True)
         return
 
-    await interaction.response.defer()
+    try:
+        await interaction.response.defer()
+    except discord.errors.HTTPException:
+        # Interaction already acknowledged, use followup instead
+        pass
 
     # Content filter
     context_lower = context.lower()
@@ -2038,16 +2097,18 @@ Now craft ONE roast about the target using either style.
                 "X-Title": "Bloom Discord Bot",
             },
             data=json.dumps({
-                "model": "deepseek/deepseek-chat-v3.1",
+                "model": "x-ai/grok-4-fast:free",
                 "messages": [
                     {
                         "role": "user",
-                        "content": prompt
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            }
+                        ]
                     }
                 ],
-                "provider": {
-                    "sort": "price"
-                },
             })
         )
 
@@ -2061,9 +2122,15 @@ Now craft ONE roast about the target using either style.
             else:
                 await interaction.followup.send(
                     "❌ Couldn't generate a joke. Try again!")
+        elif response.status_code == 402:
+            await interaction.followup.send(
+                "❌ OpenRouter API payment required. Please check your OpenRouter account billing at https://openrouter.ai/account")
+        elif response.status_code == 429:
+            await interaction.followup.send(
+                "❌ Rate limited. Please try again in a moment.")
         else:
             await interaction.followup.send(
-                f"❌ API Error: {response.status_code}")
+                f"❌ API Error: {response.status_code} - {response.text[:100]}")
 
     except Exception as e:
         logger.error(f"Tellmeajoke error: {e}")
@@ -2192,6 +2259,66 @@ async def deletekeywords_command(interaction: discord.Interaction,
     else:
         await interaction.response.send_message(
             f"❌ Keyword '{name_of_keyword}' not found.", ephemeral=True)
+
+
+@bot.tree.command(name="learn", description="Add a question-answer pair to the knowledge base (Helpers/Admins only)")
+@app_commands.describe(
+    question="The question that users might ask",
+    answer="The answer that should be provided for this question"
+)
+async def learn_command(interaction: discord.Interaction, question: str, answer: str):
+    # Check if user is admin or has helper role
+    is_authorized = is_admin_user(interaction.user.id)
+    
+    if not is_authorized and hasattr(interaction.user, 'roles'):
+        is_authorized = any(role.id in HELPER_ROLES for role in interaction.user.roles)
+    
+    if not is_authorized:
+        await interaction.response.send_message(
+            "❌ You don't have permission to use this command. Only administrators and helper roles can add to the knowledge base.", 
+            ephemeral=True
+        )
+        return
+
+    # Validate input lengths
+    if len(question.strip()) < 3:
+        await interaction.response.send_message(
+            "❌ Question must be at least 3 characters long.", 
+            ephemeral=True
+        )
+        return
+    
+    if len(answer.strip()) < 3:
+        await interaction.response.send_message(
+            "❌ Answer must be at least 3 characters long.", 
+            ephemeral=True
+        )
+        return
+
+    try:
+        # Clean the inputs
+        clean_question = question.strip()
+        clean_answer = answer.strip()
+        
+        # Save to knowledge base using existing function
+        save_qa(clean_question, clean_answer, interaction.user.id, interaction.channel.id)
+        
+        await interaction.response.send_message(
+            f"✅ **Knowledge Added Successfully!**\n\n"
+            f"**Question:** {clean_question}\n"
+            f"**Answer:** {clean_answer[:100]}{'...' if len(clean_answer) > 100 else ''}\n\n"
+            f"The AI will now be able to answer similar questions using this information.",
+            ephemeral=True
+        )
+        
+        logger.info(f"Knowledge added by {interaction.user.name} (ID: {interaction.user.id}): Q: {clean_question[:50]}... A: {clean_answer[:50]}...")
+        
+    except Exception as e:
+        logger.error(f"Error in learn command: {e}")
+        await interaction.response.send_message(
+            "❌ An error occurred while adding the knowledge. Please try again.",
+            ephemeral=True
+        )
 
 
 # -----------------------------
